@@ -1,7 +1,11 @@
-use std::io::{Result, Write};
+use std::collections::HashMap;
+use std::io::{Read, Result, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+
+const MAX_CHUNK_LEN: u64 = 4096 * 64;
 
 fn main() {
     // Skip the program name.
@@ -37,26 +41,36 @@ enum SendResult {
 
 impl SendState {
     pub fn send_one(&self, out: &mut TcpStream) -> Result<SendResult> {
-        const CHUNK_LEN: u64 = 4096 * 64;
-        let offset = self.offset.fetch_add(CHUNK_LEN, Ordering::SeqCst);
+        let offset = self.offset.fetch_add(MAX_CHUNK_LEN, Ordering::SeqCst);
 
         if offset >= self.len {
+            // All zeros signals the end of the transmission.
+            out.write_all(&[0u8; 20])?;
             return Ok(SendResult::Done);
         }
 
         println!("[{} / {}]", offset, self.len);
 
-        let end = if offset + CHUNK_LEN > self.len {
+        let end = if offset + MAX_CHUNK_LEN > self.len {
             self.len
         } else {
-            offset + CHUNK_LEN
+            offset + MAX_CHUNK_LEN
         };
 
         // We are going to do a few small writes, allow the kernel to buffer.
         out.set_nodelay(false)?;
         // TODO: Concat into buffer first, one fewere syscall.
+        // Sending the len on every chunk is redundant, but it's not *that* many
+        // bytes so for now keep it simple.
         out.write_all(&offset.to_le_bytes()[..])?;
+        out.write_all(&self.len.to_le_bytes()[..])?;
         out.write_all(&((end - offset) as u32).to_le_bytes()[..])?;
+        println!(
+            "SEND-CHUNK {} {} {}",
+            offset,
+            self.len,
+            (end - offset) as u32
+        );
 
         let end = end as i64;
         let mut off = offset as i64;
@@ -91,8 +105,9 @@ fn main_send(addr: &str, fname: &str) -> Result<()> {
 
     let listener = std::net::TcpListener::bind(addr)?;
 
-    'outer: for stream_res in listener.incoming() {
-        let mut stream = stream_res?;
+    'outer: loop {
+        let (mut stream, addr) = listener.accept()?;
+        println!("Accepted connection from {addr}.");
         loop {
             match state.send_one(&mut stream)? {
                 SendResult::Progress => continue,
@@ -100,11 +115,86 @@ fn main_send(addr: &str, fname: &str) -> Result<()> {
             }
         }
     }
+    println!("Sending complete.");
 
     Ok(())
 }
 
+struct Chunk {
+    total_len: u64,
+    offset: u64,
+    data: Vec<u8>,
+}
+
 fn main_recv(addr: &str, fname: &str) -> Result<()> {
-    eprintln!("TODO: Recv {addr} {fname}.");
-    Ok(())
+    let mut out_file = std::fs::File::create(fname)?;
+
+    // Use a relatively small buffer; we should clear the buffer very quickly.
+    let (sender, receiver) = mpsc::sync_channel::<Chunk>(16);
+
+    let writer_thread = std::thread::spawn::<_, Result<()>>(move || {
+        let mut pending = HashMap::new();
+        let mut offset = 0;
+        let mut total_len = 0;
+
+        for chunk in receiver {
+            // TODO: If it were only sent once, then we wouldn't have to check
+            // for consistency.
+            if total_len == 0 {
+                total_len = chunk.total_len;
+            } else {
+                assert_eq!(total_len, chunk.total_len);
+            }
+
+            pending.insert(chunk.offset, chunk);
+
+            // Write out all the chunks in the right order as far as we can.
+            while let Some(chunk) = pending.remove(&offset) {
+                out_file.write_all(&chunk.data[..])?;
+                offset += chunk.data.len() as u64;
+                println!("[{} / {}]", offset, total_len);
+
+                if offset == total_len {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    });
+
+    let mut stream = TcpStream::connect(addr)?;
+    loop {
+        // Header is [offset: u64le, total_len: u64le, chunk_len: u32le].
+        let mut buf = [0u8; 20];
+        stream.read_exact(&mut buf)?;
+
+        // All zeros signals the end of the transmission.
+        if buf == [0u8; 20] {
+            println!("END");
+            break;
+        }
+
+        let offset = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        let total_len = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        let chunk_len = u32::from_le_bytes(buf[16..].try_into().unwrap());
+        println!("RECV-CHUNK {} {} {}", offset, total_len, chunk_len);
+
+        assert!((chunk_len as u64) <= MAX_CHUNK_LEN);
+
+        let mut data = Vec::with_capacity(chunk_len as usize);
+        let mut limited = stream.take(chunk_len as u64);
+        limited.read_to_end(&mut data)?;
+        stream = limited.into_inner();
+
+        let chunk = Chunk {
+            offset,
+            total_len,
+            data,
+        };
+        sender.send(chunk).expect("Failed to push new chunk.");
+    }
+    std::mem::drop(sender);
+
+    writer_thread.join().expect("Failed to join writer thread.")
 }
