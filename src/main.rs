@@ -29,6 +29,18 @@ fn main() {
     }
 }
 
+fn print_progress(offset: u64, len: u64, start_time: Instant) {
+    let secs_elapsed = start_time.elapsed().as_secs_f32();
+    let percentage = (offset as f32) * 100.0 / (len as f32);
+    let bytes_per_sec = (offset as f32) / secs_elapsed;
+    let mb_per_sec = bytes_per_sec * 1e-6;
+    let secs_left = (len - offset) as f32 / bytes_per_sec;
+    let mins_left = secs_left / 60.0;
+    println!(
+        "[{offset} / {len}] {percentage:5.1}% {mb_per_sec:.2} MB/s, {mins_left:.1} minutes left",
+    );
+}
+
 struct SendState {
     len: u64,
     offset: AtomicU64,
@@ -41,7 +53,7 @@ enum SendResult {
 }
 
 impl SendState {
-    pub fn send_one(&self, out: &mut TcpStream) -> Result<SendResult> {
+    pub fn send_one(&self, start_time: Instant, out: &mut TcpStream) -> Result<SendResult> {
         let offset = self.offset.fetch_add(MAX_CHUNK_LEN, Ordering::SeqCst);
 
         if offset >= self.len {
@@ -50,7 +62,7 @@ impl SendState {
             return Ok(SendResult::Done);
         }
 
-        println!("[{} / {}]", offset, self.len);
+        print_progress(offset, self.len, start_time);
 
         let end = if offset + MAX_CHUNK_LEN > self.len {
             self.len
@@ -111,12 +123,7 @@ fn main_send(addr: &str, fname: &str) -> Result<()> {
         let start_time = Instant::now();
         println!("Accepted connection from {addr}.");
         loop {
-            let bytes_sent = state.offset.load(Ordering::SeqCst);
-            let duration = start_time.elapsed();
-            let mbps = ((bytes_sent as f32) * 1e-6) / duration.as_secs_f32();
-            println!("SPEED: {:.2} MB/s", mbps);
-
-            match state.send_one(&mut stream)? {
+            match state.send_one(start_time, &mut stream)? {
                 SendResult::Progress => continue,
                 SendResult::Done => break 'outer,
             }
@@ -140,6 +147,7 @@ fn main_recv(addr: &str, fname: &str) -> Result<()> {
     let (sender, receiver) = mpsc::sync_channel::<Chunk>(16);
 
     let writer_thread = std::thread::spawn::<_, Result<()>>(move || {
+        let start_time = Instant::now();
         let mut pending = HashMap::new();
         let mut offset = 0;
         let mut total_len = 0;
@@ -159,7 +167,7 @@ fn main_recv(addr: &str, fname: &str) -> Result<()> {
             while let Some(chunk) = pending.remove(&offset) {
                 out_file.write_all(&chunk.data[..])?;
                 offset += chunk.data.len() as u64;
-                println!("[{} / {}]", offset, total_len);
+                print_progress(offset, total_len, start_time);
 
                 if offset == total_len {
                     break;
