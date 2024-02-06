@@ -3,7 +3,7 @@ use std::io::{Read, Result, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
 const MAX_CHUNK_LEN: u64 = 4096 * 64;
@@ -17,7 +17,7 @@ fn main() {
             main_send(addr, fname).expect("Failed to send.");
         }
         [cmd, addr, fname] if cmd == "recv" => {
-            main_recv(addr, fname).expect("Failed to receive.");
+            main_recv(addr.clone(), fname).expect("Failed to receive.");
         }
         _ => {
             eprintln!("Usage:");
@@ -115,23 +115,26 @@ fn main_send(addr: &str, fname: &str) -> Result<()> {
         offset: AtomicU64::new(0),
         in_fd: file.as_raw_fd(),
     };
+    let state_arc = Arc::new(state);
 
+    let mut push_threads = Vec::new();
     let listener = std::net::TcpListener::bind(addr)?;
 
-    'outer: loop {
+    loop {
         let (mut stream, addr) = listener.accept()?;
-        let start_time = Instant::now();
         println!("Accepted connection from {addr}.");
-        loop {
-            match state.send_one(start_time, &mut stream)? {
-                SendResult::Progress => continue,
-                SendResult::Done => break 'outer,
+        let state_clone = state_arc.clone();
+        let push_thread = std::thread::spawn::<_, Result<()>>(move || {
+            let start_time = Instant::now();
+            loop {
+                match state_clone.send_one(start_time, &mut stream)? {
+                    SendResult::Progress => continue,
+                    SendResult::Done => return Ok(()),
+                }
             }
-        }
+        });
+        push_threads.push(push_thread);
     }
-    println!("Sending complete.");
-
-    Ok(())
 }
 
 struct Chunk {
@@ -140,7 +143,9 @@ struct Chunk {
     data: Vec<u8>,
 }
 
-fn main_recv(addr: &str, fname: &str) -> Result<()> {
+fn main_recv(addr: String, fname: &str) -> Result<()> {
+    let n_connections = 4;
+
     let mut out_file = std::fs::File::create(fname)?;
 
     // Use a relatively small buffer; we should clear the buffer very quickly.
@@ -178,38 +183,57 @@ fn main_recv(addr: &str, fname: &str) -> Result<()> {
         Ok(())
     });
 
-    let mut stream = TcpStream::connect(addr)?;
-    loop {
-        // Header is [offset: u64le, total_len: u64le, chunk_len: u32le].
-        let mut buf = [0u8; 20];
-        stream.read_exact(&mut buf)?;
+    let mut pull_threads = Vec::new();
 
-        // All zeros signals the end of the transmission.
-        if buf == [0u8; 20] {
-            println!("END");
-            break;
-        }
+    // We make n threads that "pull" the data from a socket.
+    for _i in 0..n_connections {
+        let addr_i = addr.clone();
+        let sender_i = sender.clone();
+        let thread_pull = std::thread::spawn::<_, Result<()>>(move || {
+            let mut stream = TcpStream::connect(addr_i)?;
+            loop {
+                // Header is [offset: u64le, total_len: u64le, chunk_len: u32le].
+                let mut buf = [0u8; 20];
+                stream.read_exact(&mut buf)?;
 
-        let offset = u64::from_le_bytes(buf[..8].try_into().unwrap());
-        let total_len = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        let chunk_len = u32::from_le_bytes(buf[16..].try_into().unwrap());
-        println!("RECV-CHUNK {} {} {}", offset, total_len, chunk_len);
+                // All zeros signals the end of the transmission.
+                if buf == [0u8; 20] {
+                    println!("END");
+                    break;
+                }
 
-        assert!((chunk_len as u64) <= MAX_CHUNK_LEN);
+                let offset = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                let total_len = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+                let chunk_len = u32::from_le_bytes(buf[16..].try_into().unwrap());
+                println!("RECV-CHUNK {} {} {}", offset, total_len, chunk_len);
 
-        let mut data = Vec::with_capacity(chunk_len as usize);
-        let mut limited = stream.take(chunk_len as u64);
-        limited.read_to_end(&mut data)?;
-        stream = limited.into_inner();
+                assert!((chunk_len as u64) <= MAX_CHUNK_LEN);
 
-        let chunk = Chunk {
-            offset,
-            total_len,
-            data,
-        };
-        sender.send(chunk).expect("Failed to push new chunk.");
+                let mut data = Vec::with_capacity(chunk_len as usize);
+                let mut limited = stream.take(chunk_len as u64);
+                limited.read_to_end(&mut data)?;
+                stream = limited.into_inner();
+
+                let chunk = Chunk {
+                    offset,
+                    total_len,
+                    data,
+                };
+                sender_i.send(chunk).expect("Failed to push new chunk.");
+            }
+            Ok(())
+        });
+        pull_threads.push(thread_pull);
     }
+
+    // All of the threads have a copy of the sender, we no longer need the
+    // original, and we need to drop it so that the wirter thread can exit
+    // when all senders are done.
     std::mem::drop(sender);
+
+    for pull_thread in pull_threads {
+        pull_thread.join().expect("Failed to join pull thread.")?;
+    }
 
     writer_thread.join().expect("Failed to join writer thread.")
 }
