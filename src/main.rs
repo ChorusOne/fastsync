@@ -4,6 +4,7 @@ use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::time::Instant;
 
 const MAX_CHUNK_LEN: u64 = 4096 * 64;
 
@@ -107,8 +108,14 @@ fn main_send(addr: &str, fname: &str) -> Result<()> {
 
     'outer: loop {
         let (mut stream, addr) = listener.accept()?;
+        let start_time = Instant::now();
         println!("Accepted connection from {addr}.");
         loop {
+            let bytes_sent = state.offset.load(Ordering::SeqCst);
+            let duration = start_time.elapsed();
+            let mbps = ((bytes_sent as f32) * 1e-6) / duration.as_secs_f32();
+            println!("SPEED: {:.2} MB/s", mbps);
+
             match state.send_one(&mut stream)? {
                 SendResult::Progress => continue,
                 SendResult::Done => break 'outer,
