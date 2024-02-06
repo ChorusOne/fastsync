@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{Read, Result, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
@@ -16,14 +17,14 @@ fn main() {
         [cmd, addr, fname] if cmd == "send" => {
             main_send(addr, fname).expect("Failed to send.");
         }
-        [cmd, addr, fname] if cmd == "recv" => {
-            main_recv(addr.clone(), fname).expect("Failed to receive.");
+        [cmd, addr, fname, n_conn] if cmd == "recv" => {
+            main_recv(addr.clone(), fname, n_conn).expect("Failed to receive.");
         }
         _ => {
             eprintln!("Usage:");
             // TODO: Support multiple files, transfer the filenames.
             eprintln!("  fastsync send <listen-addr> <in-file>");
-            eprintln!("  fastsync recv <server-addr> <out-file>");
+            eprintln!("  fastsync recv <server-addr> <out-file> <n>");
             return;
         }
     }
@@ -143,8 +144,8 @@ struct Chunk {
     data: Vec<u8>,
 }
 
-fn main_recv(addr: String, fname: &str) -> Result<()> {
-    let n_connections = 4;
+fn main_recv(addr: String, fname: &str, n_conn: &str) -> Result<()> {
+    let n_connections: u32 = u32::from_str(n_conn).expect("Failed to parse number of connections.");
 
     let mut out_file = std::fs::File::create(fname)?;
 
