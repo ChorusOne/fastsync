@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::io::{Read, Result, Write};
+use std::fs::File;
+use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
 use std::str::FromStr;
@@ -42,8 +43,33 @@ impl TransferPlan {
         std::io::stdin().read_line(&mut answer)?;
         match &answer[..] {
             "y\n" => Ok(()),
-            _ => Err(std::io::Error::other("Receive rejected by the user.")),
+            _ => Err(Error::other("Receive rejected by the user.")),
         }
+    }
+
+    /// Crash if the plan contains absolute paths.
+    ///
+    /// We send the file names ahead of time and ask the user to confirm, but
+    /// even then, if that list can include `/etc/ssh/sshd_config` or something,
+    /// that could be pretty disastrous. Only allow relative paths.
+    fn assert_paths_relative(&self) {
+        for file in &self.0 {
+            assert!(
+                !file.name.starts_with("/"),
+                "Transferring files with an absolute path name is not allowed.",
+            );
+        }
+    }
+}
+
+/// The index of a file in the transfer plan.
+#[derive(BorshDeserialize, BorshSerialize, Copy, Clone, Debug, Eq, Hash, PartialEq)]
+struct FileId(u16);
+
+impl FileId {
+    fn from_usize(i: usize) -> FileId {
+        assert!(i < u16::MAX as usize, "Can transfer at most 2^16 files.");
+        FileId(i as _)
     }
 }
 
@@ -83,6 +109,7 @@ fn print_progress(offset: u64, len: u64, start_time: Instant) {
 }
 
 struct SendState {
+    id: FileId,
     len: u64,
     offset: AtomicU64,
     in_fd: RawFd,
@@ -93,13 +120,36 @@ enum SendResult {
     Progress,
 }
 
+/// Metadata about a chunk of data that follows.
+///
+/// The Borsh-generated representation of this is zero-overhead (14 bytes).
+#[derive(BorshDeserialize, BorshSerialize, Debug)]
+struct ChunkHeader {
+    /// Which file is the chunk from?
+    file_id: FileId,
+
+    /// Byte offset in the file where the chunk starts.
+    offset: u64,
+
+    /// Length of the chunk in bytes.
+    len: u32,
+}
+
+impl ChunkHeader {
+    fn to_bytes(&self) -> [u8; 14] {
+        let mut buffer = [0_u8; 14];
+        let mut cursor = std::io::Cursor::new(&mut buffer[..]);
+        self.serialize(&mut cursor)
+            .expect("Writing to memory never fails.");
+        buffer
+    }
+}
+
 impl SendState {
     pub fn send_one(&self, start_time: Instant, out: &mut TcpStream) -> Result<SendResult> {
         let offset = self.offset.fetch_add(MAX_CHUNK_LEN, Ordering::SeqCst);
 
         if offset >= self.len {
-            // All zeros signals the end of the transmission.
-            out.write_all(&[0u8; 20])?;
             return Ok(SendResult::Done);
         }
 
@@ -111,20 +161,13 @@ impl SendState {
             offset + MAX_CHUNK_LEN
         };
 
-        // We are going to do a few small writes, allow the kernel to buffer.
-        out.set_nodelay(false)?;
-        // TODO: Concat into buffer first, one fewere syscall.
-        // Sending the len on every chunk is redundant, but it's not *that* many
-        // bytes so for now keep it simple.
-        out.write_all(&offset.to_le_bytes()[..])?;
-        out.write_all(&self.len.to_le_bytes()[..])?;
-        out.write_all(&((end - offset) as u32).to_le_bytes()[..])?;
-        println!(
-            "SEND-CHUNK {} {} {}",
+        let header = ChunkHeader {
+            file_id: self.id,
             offset,
-            self.len,
-            (end - offset) as u32
-        );
+            len: u32::try_from(end - offset).expect("Chunks are smaller that 4 GiB."),
+        };
+        out.write_all(&header.to_bytes()[..])?;
+        println!("SEND-CHUNK {:?}", header);
 
         let end = end as i64;
         let mut off = offset as i64;
@@ -133,25 +176,23 @@ impl SendState {
             let count = (end - off) as usize;
             let n_written = unsafe { libc::sendfile(out_fd, self.in_fd, &mut off, count) };
             if n_written < 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(Error::last_os_error());
             }
 
             if off >= end {
                 break;
             }
         }
-        // Send now, stop buffering.
-        out.set_nodelay(true)?;
 
         Ok(SendResult::Progress)
     }
 }
 
 fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
-    let mut file_plans = Vec::new();
+    let mut plan = TransferPlan(Vec::new());
     let mut send_states = Vec::new();
 
-    for fname in fnames {
+    for (i, fname) in fnames.iter().enumerate() {
         let file = std::fs::File::open(fname)?;
         let metadata = file.metadata()?;
         let file_plan = FilePlan {
@@ -159,16 +200,19 @@ fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
             len: metadata.len(),
         };
         let state = SendState {
+            id: FileId::from_usize(i),
             len: metadata.len(),
             offset: AtomicU64::new(0),
             in_fd: file.as_raw_fd(),
         };
-        file_plans.push(file_plan);
+        plan.0.push(file_plan);
         send_states.push(state);
     }
 
+    plan.assert_paths_relative();
+
     let state_arc = Arc::new(send_states);
-    let mut plan = Some(TransferPlan(file_plans));
+    let mut plan = Some(plan);
 
     let mut push_threads = Vec::new();
     let listener = std::net::TcpListener::bind(addr)?;
@@ -188,64 +232,82 @@ fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
         let state_clone = state_arc.clone();
         let push_thread = std::thread::spawn::<_, Result<()>>(move || {
             let start_time = Instant::now();
-            loop {
-                // TODO: Send the files one by one.
-                //match state_clone.send_one(start_time, &mut stream)? {
-                //    SendResult::Progress => continue,
-                //    SendResult::Done => return Ok(()),
-                //}
+            // All the threads iterate through all the files one by one, so all
+            // the threads collaborate on sending the first one, then the second
+            // one, etc.
+            'files: for file in state_clone.iter() {
+                'chunks: loop {
+                    match file.send_one(start_time, &mut stream)? {
+                        SendResult::Progress => continue 'chunks,
+                        SendResult::Done => continue 'files,
+                    }
+                }
             }
+
+            Ok(())
         });
         push_threads.push(push_thread);
     }
 }
 
 struct Chunk {
-    total_len: u64,
+    file_id: FileId,
     offset: u64,
     data: Vec<u8>,
 }
 
-fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
-    let fname = "TODO: Fix";
-    let n_connections: u32 = u32::from_str(n_conn).expect("Failed to parse number of connections.");
+struct FileReceiver {
+    fname: String,
 
-    let mut out_file = std::fs::File::create(fname)?;
+    /// The file we’re writing to, if we have started writing.
+    ///
+    /// We don’t open the file immediately so we don’t create a zero-sized file
+    /// when a transfer fails. We only open the file after we have at least some
+    /// data for it.
+    out_file: Option<File>,
 
-    // Use a relatively small buffer; we should clear the buffer very quickly.
-    let (sender, receiver) = mpsc::sync_channel::<Chunk>(16);
+    /// Chunks that we cannot yet write because a preceding chunk has not yet arrived.
+    pending: HashMap<u64, Chunk>,
 
-    let writer_thread = std::thread::spawn::<_, Result<()>>(move || {
-        let start_time = Instant::now();
-        let mut pending = HashMap::new();
-        let mut offset = 0;
-        let mut total_len = 0;
+    /// How many bytes we have written so far.
+    offset: u64,
 
-        for chunk in receiver {
-            // TODO: If it were only sent once, then we wouldn't have to check
-            // for consistency.
-            if total_len == 0 {
-                total_len = chunk.total_len;
-            } else {
-                assert_eq!(total_len, chunk.total_len);
-            }
+    /// How many bytes we should receive.
+    total_len: u64,
+}
 
-            pending.insert(chunk.offset, chunk);
+impl FileReceiver {
+    fn new(plan: FilePlan) -> FileReceiver {
+        FileReceiver {
+            fname: plan.name,
+            out_file: None,
+            pending: HashMap::new(),
+            offset: 0,
+            total_len: plan.len,
+        }
+    }
 
-            // Write out all the chunks in the right order as far as we can.
-            while let Some(chunk) = pending.remove(&offset) {
-                out_file.write_all(&chunk.data[..])?;
-                offset += chunk.data.len() as u64;
-                print_progress(offset, total_len, start_time);
+    /// Write or buffer a chunk that we received for this file.
+    fn handle_chunk(&mut self, chunk: Chunk) -> Result<()> {
+        let mut out_file = match self.out_file.take() {
+            None => File::create(&self.fname)?,
+            Some(f) => f,
+        };
+        self.pending.insert(chunk.offset, chunk);
 
-                if offset == total_len {
-                    break;
-                }
-            }
+        // Write out all the chunks in the right order as far as we can.
+        while let Some(chunk) = self.pending.remove(&self.offset) {
+            out_file.write_all(&chunk.data[..])?;
+            self.offset += chunk.data.len() as u64;
         }
 
+        self.out_file = Some(out_file);
         Ok(())
-    });
+    }
+}
+
+fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
+    let n_connections: u32 = u32::from_str(n_conn).expect("Failed to parse number of connections.");
 
     // First we initiate one connection. The sender will send the plan over
     // that. We read it. Unbuffered, because we want to skip the buffer for the
@@ -253,6 +315,26 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
     let mut stream = TcpStream::connect(addr)?;
     let plan = TransferPlan::deserialize_reader(&mut stream)?;
     plan.ask_confirm_receive()?;
+
+    // Use a relatively small buffer; we should clear the buffer very quickly.
+    let (sender, receiver) = mpsc::sync_channel::<Chunk>(16);
+
+    let writer_thread = std::thread::spawn::<_, Result<()>>(move || {
+        let total_len: u64 = plan.0.iter().map(|f| f.len).sum();
+        let mut files: Vec<_> = plan.0.into_iter().map(FileReceiver::new).collect();
+
+        let start_time = Instant::now();
+        let mut bytes_received: u64 = 0;
+
+        for chunk in receiver {
+            let file = &mut files[chunk.file_id.0 as usize];
+            bytes_received += chunk.data.len() as u64;
+            file.handle_chunk(chunk)?;
+            print_progress(bytes_received, total_len, start_time);
+        }
+
+        Ok(())
+    });
 
     // We make n threads that "pull" the data from a socket. The first socket we
     // already ahve, the transfer plan was sent on that one.
@@ -268,31 +350,28 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
         let sender_i = sender.clone();
         let thread_pull = std::thread::spawn::<_, Result<()>>(move || {
             loop {
-                // Header is [offset: u64le, total_len: u64le, chunk_len: u32le].
-                let mut buf = [0u8; 20];
-                stream.read_exact(&mut buf)?;
+                // Read a chunk header. If we hit EOF, that is not an error, it
+                // means that the sender has nothing more to send so we can just
+                // exit here.
+                let mut buf = [0u8; 14];
+                match stream.read_exact(&mut buf) {
+                    Ok(..) => {}
+                    Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                    Err(err) => return Err(err),
+                };
 
-                // All zeros signals the end of the transmission.
-                if buf == [0u8; 20] {
-                    println!("END");
-                    break;
-                }
+                let header = ChunkHeader::try_from_slice(&buf[..])?;
+                assert!((header.len as u64) <= MAX_CHUNK_LEN);
+                println!("RECV-CHUNK {:?}", header);
 
-                let offset = u64::from_le_bytes(buf[..8].try_into().unwrap());
-                let total_len = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-                let chunk_len = u32::from_le_bytes(buf[16..].try_into().unwrap());
-                println!("RECV-CHUNK {} {} {}", offset, total_len, chunk_len);
-
-                assert!((chunk_len as u64) <= MAX_CHUNK_LEN);
-
-                let mut data = Vec::with_capacity(chunk_len as usize);
-                let mut limited = stream.take(chunk_len as u64);
+                let mut data = Vec::with_capacity(header.len as usize);
+                let mut limited = stream.take(header.len as u64);
                 limited.read_to_end(&mut data)?;
                 stream = limited.into_inner();
 
                 let chunk = Chunk {
-                    offset,
-                    total_len,
+                    file_id: header.file_id,
+                    offset: header.offset,
                     data,
                 };
                 sender_i.send(chunk).expect("Failed to push new chunk.");
