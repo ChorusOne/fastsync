@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::net::TcpStream;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -112,7 +112,7 @@ struct SendState {
     id: FileId,
     len: u64,
     offset: AtomicU64,
-    in_fd: RawFd,
+    in_fd: Arc<OwnedFd>,
 }
 
 enum SendResult {
@@ -148,39 +148,35 @@ impl ChunkHeader {
 impl SendState {
     pub fn send_one(&self, start_time: Instant, out: &mut TcpStream) -> Result<SendResult> {
         let offset = self.offset.fetch_add(MAX_CHUNK_LEN, Ordering::SeqCst);
+        let end = self.len.min(offset + MAX_CHUNK_LEN);
 
-        if offset >= self.len {
+        if offset >= self.len || offset >= end {
             return Ok(SendResult::Done);
         }
 
         print_progress(offset, self.len, start_time);
 
-        let end = if offset + MAX_CHUNK_LEN > self.len {
-            self.len
-        } else {
-            offset + MAX_CHUNK_LEN
-        };
-
         let header = ChunkHeader {
             file_id: self.id,
             offset,
-            len: u32::try_from(end - offset).expect("Chunks are smaller that 4 GiB."),
+            len: u32::try_from(end - offset).expect("Chunks are smaller than 4 GiB."),
         };
         out.write_all(&header.to_bytes()[..])?;
-        println!("SEND-CHUNK {:?}", header);
+        println!(
+            "SEND-CHUNK {:?} header_len={}",
+            header,
+            borsh::to_vec(&header)?.len()
+        );
 
         let end = end as i64;
         let mut off = offset as i64;
         let out_fd = out.as_raw_fd();
-        loop {
+        let in_fd = self.in_fd.as_raw_fd();
+        while off < end {
             let count = (end - off) as usize;
-            let n_written = unsafe { libc::sendfile(out_fd, self.in_fd, &mut off, count) };
+            let n_written = unsafe { libc::sendfile64(out_fd, in_fd, &mut off, count) };
             if n_written < 0 {
                 return Err(Error::last_os_error());
-            }
-
-            if off >= end {
-                break;
             }
         }
 
@@ -203,7 +199,7 @@ fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
             id: FileId::from_usize(i),
             len: metadata.len(),
             offset: AtomicU64::new(0),
-            in_fd: file.as_raw_fd(),
+            in_fd: Arc::new(file.into()),
         };
         plan.0.push(file_plan);
         send_states.push(state);
@@ -217,6 +213,8 @@ fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
     let mut push_threads = Vec::new();
     let listener = std::net::TcpListener::bind(addr)?;
 
+    println!("Waiting for the receiver ...");
+
     loop {
         let (mut stream, addr) = listener.accept()?;
         println!("Accepted connection from {addr}.");
@@ -227,24 +225,24 @@ fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
             plan.serialize(&mut buffer)
                 .expect("Write to Vec<u8> does not fail.");
             stream.write_all(&buffer[..])?;
+            println!("Waiting for the receiver to accept ...");
         }
 
         let state_clone = state_arc.clone();
-        let push_thread = std::thread::spawn::<_, Result<()>>(move || {
+        let push_thread = std::thread::spawn(move || {
             let start_time = Instant::now();
             // All the threads iterate through all the files one by one, so all
             // the threads collaborate on sending the first one, then the second
             // one, etc.
             'files: for file in state_clone.iter() {
                 'chunks: loop {
-                    match file.send_one(start_time, &mut stream)? {
-                        SendResult::Progress => continue 'chunks,
-                        SendResult::Done => continue 'files,
+                    match file.send_one(start_time, &mut stream) {
+                        Ok(SendResult::Progress) => continue 'chunks,
+                        Ok(SendResult::Done) => continue 'files,
+                        Err(err) => panic!("Failed to send: {err}"),
                     }
                 }
             }
-
-            Ok(())
         });
         push_threads.push(push_thread);
     }
@@ -333,6 +331,10 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
             print_progress(bytes_received, total_len, start_time);
         }
 
+        if bytes_received < total_len {
+            panic!("Transmission ended, but not all data was received.");
+        }
+
         Ok(())
     });
 
@@ -361,8 +363,13 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
                 };
 
                 let header = ChunkHeader::try_from_slice(&buf[..])?;
-                assert!((header.len as u64) <= MAX_CHUNK_LEN);
                 println!("RECV-CHUNK {:?}", header);
+                assert!(
+                    (header.len as u64) <= MAX_CHUNK_LEN,
+                    "{} <= {}",
+                    header.len,
+                    MAX_CHUNK_LEN
+                );
 
                 let mut data = Vec::with_capacity(header.len as usize);
                 let mut limited = stream.take(header.len as u64);
