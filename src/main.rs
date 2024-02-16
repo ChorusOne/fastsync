@@ -29,6 +29,24 @@ struct FilePlan {
     len: u64,
 }
 
+impl TransferPlan {
+    /// Ask the user if they're okay (over)writing the target files.
+    fn ask_confirm_receive(&self) -> Result<()> {
+        println!("  SIZE_BYTES  FILENAME");
+        for file in &self.0 {
+            println!("{:>12}  {}", file.len, file.name);
+        }
+        print!("Receiving will overwrite existing files with those names. Continue? [y/N] ");
+        let mut answer = String::new();
+        std::io::stdout().flush()?;
+        std::io::stdin().read_line(&mut answer)?;
+        match &answer[..] {
+            "y\n" => Ok(()),
+            _ => Err(std::io::Error::other("Receive rejected by the user.")),
+        }
+    }
+}
+
 fn main() {
     // Skip the program name.
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -234,7 +252,7 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
     // remaining reads, but the header is tiny so it should be okay.
     let mut stream = TcpStream::connect(addr)?;
     let plan = TransferPlan::deserialize_reader(&mut stream)?;
-    panic!("Plan: {plan:?}");
+    plan.ask_confirm_receive()?;
 
     // We make n threads that "pull" the data from a socket. The first socket we
     // already ahve, the transfer plan was sent on that one.
