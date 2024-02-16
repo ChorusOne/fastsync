@@ -7,25 +7,47 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
+use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
+
 const MAX_CHUNK_LEN: u64 = 4096 * 64;
+
+/// Metadata about all the files we want to transfer.
+///
+/// We serialize the plan using Borsh, because it has a small Rust crate with
+/// few dependencies, and it can do derive, and the wire format is similar to
+/// what we’d write by hand anyway (count, then length-prefixed file names).
+/// The plan is tiny compared to the data and we assume we’re not dealing with
+/// malicious senders or receivers, so it doesn’t matter so much.
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+struct TransferPlan(Vec<FilePlan>);
+
+/// Metadata about a file to transfer.
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+struct FilePlan {
+    name: String,
+    len: u64,
+}
 
 fn main() {
     // Skip the program name.
     let args: Vec<_> = std::env::args().skip(1).collect();
 
-    match &args[..] {
-        [cmd, addr, fname] if cmd == "send" => {
-            main_send(addr, fname).expect("Failed to send.");
+    match args.first().map(|s| &s[..]) {
+        Some("send") if args.len() >= 3 => {
+            let addr = &args[1];
+            let fnames = &args[2..];
+            main_send(addr, fnames).expect("Failed to send.");
         }
-        [cmd, addr, fname, n_conn] if cmd == "recv" => {
-            main_recv(addr.clone(), fname, n_conn).expect("Failed to receive.");
+        Some("recv") if args.len() == 3 => {
+            let addr = &args[1];
+            let n_conn = &args[2];
+            main_recv(addr, n_conn).expect("Failed to receive.");
         }
         _ => {
             eprintln!("Usage:");
-            // TODO: Support multiple files, transfer the filenames.
-            eprintln!("  fastsync send <listen-addr> <in-file>");
-            eprintln!("  fastsync recv <server-addr> <out-file> <n>");
-            return;
+            eprintln!("  fastsync send <listen-addr> <in-files...>");
+            eprintln!("  fastsync recv <server-addr> <num-connections>");
         }
     }
 }
@@ -107,16 +129,28 @@ impl SendState {
     }
 }
 
-fn main_send(addr: &str, fname: &str) -> Result<()> {
-    let file = std::fs::File::open(fname)?;
-    let metadata = file.metadata()?;
+fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
+    let mut file_plans = Vec::new();
+    let mut send_states = Vec::new();
 
-    let state = SendState {
-        len: metadata.len(),
-        offset: AtomicU64::new(0),
-        in_fd: file.as_raw_fd(),
-    };
-    let state_arc = Arc::new(state);
+    for fname in fnames {
+        let file = std::fs::File::open(fname)?;
+        let metadata = file.metadata()?;
+        let file_plan = FilePlan {
+            name: fname.clone(),
+            len: metadata.len(),
+        };
+        let state = SendState {
+            len: metadata.len(),
+            offset: AtomicU64::new(0),
+            in_fd: file.as_raw_fd(),
+        };
+        file_plans.push(file_plan);
+        send_states.push(state);
+    }
+
+    let state_arc = Arc::new(send_states);
+    let mut plan = Some(TransferPlan(file_plans));
 
     let mut push_threads = Vec::new();
     let listener = std::net::TcpListener::bind(addr)?;
@@ -124,14 +158,24 @@ fn main_send(addr: &str, fname: &str) -> Result<()> {
     loop {
         let (mut stream, addr) = listener.accept()?;
         println!("Accepted connection from {addr}.");
+
+        // If we are the first connection, then we need to send the plan first.
+        if let Some(plan) = plan.take() {
+            let mut buffer = Vec::new();
+            plan.serialize(&mut buffer)
+                .expect("Write to Vec<u8> does not fail.");
+            stream.write_all(&buffer[..])?;
+        }
+
         let state_clone = state_arc.clone();
         let push_thread = std::thread::spawn::<_, Result<()>>(move || {
             let start_time = Instant::now();
             loop {
-                match state_clone.send_one(start_time, &mut stream)? {
-                    SendResult::Progress => continue,
-                    SendResult::Done => return Ok(()),
-                }
+                // TODO: Send the files one by one.
+                //match state_clone.send_one(start_time, &mut stream)? {
+                //    SendResult::Progress => continue,
+                //    SendResult::Done => return Ok(()),
+                //}
             }
         });
         push_threads.push(push_thread);
@@ -144,7 +188,8 @@ struct Chunk {
     data: Vec<u8>,
 }
 
-fn main_recv(addr: String, fname: &str, n_conn: &str) -> Result<()> {
+fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
+    let fname = "TODO: Fix";
     let n_connections: u32 = u32::from_str(n_conn).expect("Failed to parse number of connections.");
 
     let mut out_file = std::fs::File::create(fname)?;
@@ -184,14 +229,26 @@ fn main_recv(addr: String, fname: &str, n_conn: &str) -> Result<()> {
         Ok(())
     });
 
+    // First we initiate one connection. The sender will send the plan over
+    // that. We read it. Unbuffered, because we want to skip the buffer for the
+    // remaining reads, but the header is tiny so it should be okay.
+    let mut stream = TcpStream::connect(addr)?;
+    let plan = TransferPlan::deserialize_reader(&mut stream)?;
+    panic!("Plan: {plan:?}");
+
+    // We make n threads that "pull" the data from a socket. The first socket we
+    // already ahve, the transfer plan was sent on that one.
+    let mut streams = vec![stream];
+    for _ in 1..n_connections {
+        streams.push(TcpStream::connect(addr)?);
+    }
+
     let mut pull_threads = Vec::new();
 
     // We make n threads that "pull" the data from a socket.
-    for _i in 0..n_connections {
-        let addr_i = addr.clone();
+    for mut stream in streams {
         let sender_i = sender.clone();
         let thread_pull = std::thread::spawn::<_, Result<()>>(move || {
-            let mut stream = TcpStream::connect(addr_i)?;
             loop {
                 // Header is [offset: u64le, total_len: u64le, chunk_len: u32le].
                 let mut buf = [0u8; 20];
