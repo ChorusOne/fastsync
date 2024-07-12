@@ -29,5 +29,4 @@ On the receiving end, suppose we download with 32 TCP connections:
 
 ## Known issues
 
- * The sender doesn't exit when it's done.
  * It's too spammy.

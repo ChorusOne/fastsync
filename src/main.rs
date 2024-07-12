@@ -257,8 +257,11 @@ fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
         push_threads.push(push_thread);
     }
 
-    // If we stopped the listener loop, then the receiver should have signalled
-    // that it received everything, so all sender threads should have finished.
+    // For a long transfer, the listener loop exists when the receiver signals
+    // that it received everything by connecting one final time. But it can also
+    // happen that we pushed everything before the receiver was even done
+    // spawning connections, so either way, we need to wait for the push threads
+    // to finish sending.
     for push_thread in push_threads {
         push_thread.join().expect("Failed to wait for push thread.");
     }
@@ -429,6 +432,21 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
 
     for pull_thread in pull_threads {
         pull_thread.join().expect("Failed to join pull thread.")?;
+    }
+
+    // After all pulls are done and the transfer is complete, the sender is
+    // still stuck in its accept() call listening for potential additional
+    // readers. One way to get around that is by doing a non-blocking accept,
+    // but then we either have to busy-wait, or if we add a sleep then we create
+    // a polling delay. Another way is to make everything async, but then we
+    // have to add a dependency on the async ecosystem and pull in 100s of
+    // crates, and create gigabytes of build artifacts, just to do a clean exit.
+    // So as a hack, just connect one more time to wake up the sender's accept()
+    // loop. It will conclude there is nothing to send and then exit.
+    match TcpStream::connect(addr) {
+        Ok(stream) => std::mem::drop(stream),
+        // Too bad if we can't wake up the sender, but it's not our problem.
+        Err(_) => {}
     }
 
     writer_thread.join().expect("Failed to join writer thread.");
