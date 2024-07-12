@@ -229,6 +229,15 @@ fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
             println!("Waiting for the receiver to accept ...");
         }
 
+        // If all files have been transferred completely, then we are done.
+        // Stop the listener, don't send anything over our new connection.
+        let is_done = state_arc
+            .iter()
+            .all(|f| f.offset.load(Ordering::SeqCst) >= f.len);
+        if is_done {
+            break;
+        }
+
         let state_clone = state_arc.clone();
         let push_thread = std::thread::spawn(move || {
             let start_time = Instant::now();
@@ -247,6 +256,14 @@ fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
         });
         push_threads.push(push_thread);
     }
+
+    // If we stopped the listener loop, then the receiver should have signalled
+    // that it received everything, so all sender threads should have finished.
+    for push_thread in push_threads {
+        push_thread.join().expect("Failed to wait for push thread.");
+    }
+
+    Ok(())
 }
 
 struct Chunk {
@@ -347,10 +364,18 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
     });
 
     // We make n threads that "pull" the data from a socket. The first socket we
-    // already ahve, the transfer plan was sent on that one.
+    // already have, the transfer plan was sent on that one.
     let mut streams = vec![stream];
     for _ in 1..n_connections {
-        streams.push(TcpStream::connect(addr)?);
+        match TcpStream::connect(addr) {
+            // The sender stops listening after all transfers are complete. For
+            // small transfers, it might have already sent the entire file on
+            // the initial connection before we get a chance to open the others,
+            // so connection refused is not a problem.
+            Ok(stream) => streams.push(stream),
+            Err(err) if err.kind() == ErrorKind::ConnectionRefused => break,
+            Err(err) => panic!("Failed to connect to sender: {err:?}"),
+        }
     }
 
     let mut pull_threads = Vec::new();
@@ -367,6 +392,7 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
                 match stream.read_exact(&mut buf) {
                     Ok(..) => {}
                     Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                    Err(err) if err.kind() == ErrorKind::ConnectionReset => break,
                     Err(err) => return Err(err),
                 };
 
