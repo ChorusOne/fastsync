@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -288,7 +289,13 @@ impl FileReceiver {
     /// Write or buffer a chunk that we received for this file.
     fn handle_chunk(&mut self, chunk: Chunk) -> Result<()> {
         let mut out_file = match self.out_file.take() {
-            None => File::create(&self.fname)?,
+            None => {
+                let path: &Path = self.fname.as_ref();
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                File::create(path)?
+            }
             Some(f) => f,
         };
         self.pending.insert(chunk.offset, chunk);
@@ -317,7 +324,7 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
     // Use a relatively small buffer; we should clear the buffer very quickly.
     let (sender, receiver) = mpsc::sync_channel::<Chunk>(16);
 
-    let writer_thread = std::thread::spawn::<_, Result<()>>(move || {
+    let writer_thread = std::thread::spawn::<_, ()>(move || {
         let total_len: u64 = plan.0.iter().map(|f| f.len).sum();
         let mut files: Vec<_> = plan.0.into_iter().map(FileReceiver::new).collect();
 
@@ -327,15 +334,16 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
         for chunk in receiver {
             let file = &mut files[chunk.file_id.0 as usize];
             bytes_received += chunk.data.len() as u64;
-            file.handle_chunk(chunk)?;
+            // On error, rather than exiting the thread and crashing the writing
+            // end of the channel, just crash the entire program so that the
+            // error message is clearer.
+            file.handle_chunk(chunk).expect("Failed to write chunk.");
             print_progress(bytes_received, total_len, start_time);
         }
 
         if bytes_received < total_len {
             panic!("Transmission ended, but not all data was received.");
         }
-
-        Ok(())
     });
 
     // We make n threads that "pull" the data from a socket. The first socket we
@@ -397,5 +405,7 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
         pull_thread.join().expect("Failed to join pull thread.")?;
     }
 
-    writer_thread.join().expect("Failed to join writer thread.")
+    writer_thread.join().expect("Failed to join writer thread.");
+
+    Ok(())
 }
