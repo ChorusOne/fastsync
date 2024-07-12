@@ -314,7 +314,20 @@ impl FileReceiver {
                 if let Some(dir) = path.parent() {
                     std::fs::create_dir_all(dir)?;
                 }
-                File::create(path)?
+                let file = File::create(path)?;
+
+                // Resize the file to its final size already:
+                // * So that the file system can do a better job of allocating
+                //   a single extent for it, and it doesn't have to fragment
+                //   the file.
+                // * If we run out of space, we learn about that before we waste
+                //   time on the transfer (although then maybe we should do it
+                //   before we receive a chunk after all?).
+                // This can make debugging a bit harder, because when you look
+                // at just the file size you might think it's fully transferred.
+                file.set_len(self.total_len)?;
+
+                file
             }
             Some(f) => f,
         };
