@@ -341,7 +341,11 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
     let plan = TransferPlan::deserialize_reader(&mut stream)?;
     plan.ask_confirm_receive()?;
 
-    // Use a relatively small buffer; we should clear the buffer very quickly.
+    // The pull threads are going to receive chunks and push them into this
+    // channel. Then we have one IO writer thread that either parks the chunks
+    // or writes them to disk. A small channel is enough for this: if the disk
+    // is faster than the network then the channel will be empty most of the
+    // time, and if the network is faster the channel will be full all the time.
     let (sender, receiver) = mpsc::sync_channel::<Chunk>(16);
 
     let writer_thread = std::thread::spawn::<_, ()>(move || {
@@ -382,8 +386,6 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
     }
 
     let mut pull_threads = Vec::new();
-
-    // We make n threads that "pull" the data from a socket.
     for mut stream in streams {
         let sender_i = sender.clone();
         let thread_pull = std::thread::spawn::<_, Result<()>>(move || {
