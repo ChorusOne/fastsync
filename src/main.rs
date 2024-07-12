@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::net::TcpStream;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -113,7 +113,7 @@ struct SendState {
     id: FileId,
     len: u64,
     offset: AtomicU64,
-    in_fd: Arc<OwnedFd>,
+    in_file: File,
 }
 
 enum SendResult {
@@ -172,7 +172,7 @@ impl SendState {
         let end = end as i64;
         let mut off = offset as i64;
         let out_fd = out.as_raw_fd();
-        let in_fd = self.in_fd.as_raw_fd();
+        let in_fd = self.in_file.as_raw_fd();
         while off < end {
             let count = (end - off) as usize;
             let n_written = unsafe { libc::sendfile64(out_fd, in_fd, &mut off, count) };
@@ -200,7 +200,7 @@ fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
             id: FileId::from_usize(i),
             len: metadata.len(),
             offset: AtomicU64::new(0),
-            in_fd: Arc::new(file.into()),
+            in_file: file,
         };
         plan.0.push(file_plan);
         send_states.push(state);
