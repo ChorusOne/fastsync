@@ -4,6 +4,8 @@ For when you need to transfer files between machines fast, but somehow it's not
 saturating the network card. This tool transfers over multiple TCP connections
 to try and saturate it.
 
+Fastsync targets Linux only.
+
 ## Building
 
 For your local machine:

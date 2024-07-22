@@ -175,6 +175,8 @@ impl SendState {
         let in_fd = self.in_file.as_raw_fd();
         while off < end {
             let count = (end - off) as usize;
+            // Note, sendfile advances the offset by the number of bytes written
+            // so we should not increment `off` ourselves.
             let n_written = unsafe { libc::sendfile64(out_fd, in_fd, &mut off, count) };
             if n_written < 0 {
                 return Err(Error::last_os_error());
