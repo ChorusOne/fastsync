@@ -27,7 +27,7 @@ like 7999 (assuming it's not bound to). Then on the sending end:
 
 On the receiving end, suppose we download with 32 TCP connections:
 
-    fastsync recv 100.71.154.83:7999 file.tar.gz 32
+    fastsync recv 100.71.154.83:7999 32
 
 ## Known issues
 
