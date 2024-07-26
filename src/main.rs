@@ -1,3 +1,10 @@
+// Fastsync -- Send files quickly by leveraging multiple TCP connections.
+// Copyright 2024 Chorus One
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// A copy of the License has been included in the root of the repository.
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read, Result, Write};

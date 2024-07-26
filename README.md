@@ -1,10 +1,23 @@
 # Fastsync
 
-For when you need to transfer files between machines fast, but somehow it's not
-saturating the network card. This tool transfers over multiple TCP connections
-to try and saturate it.
+Fastsync transfers files between machines as fast as the network allows. Tools
+that transfer files over a single TCP connection — what `rsync`, `scp`, and
+even raw `netcat` do — often fail to saturate the network link. This is due to
+[head-of-line blocking][tcp-hol]. Opening multiple TCP connections can bring
+a significant boost in transfer speed.
 
-Fastsync targets Linux only.
+Fastsync targets the following use case:
+
+ * **Linux only.** For now.
+ * **Confidentiality and authentication are handled externally.** Fastsync does
+   not encrypt the files or authenticate the receiver. It assumes you are using
+   it over e.g. a Wireguard network interface.
+ * **Compression is handled externally.** Fastsync does not compress the stream.
+   If the data volume benefits from compression, then compress the files ahead
+   of time with e.g. `lz4`, `brotli`, or `zstd`.
+ * **A full transfer is necessary.** Fastsync always sends all files. If some
+   files are already present at the receiving side, or similar data is already
+   present, `rsync` might be a better fit.
 
 ## Building
 
@@ -32,3 +45,12 @@ On the receiving end, suppose we download with 32 TCP connections:
 ## Known issues
 
  * It's too spammy.
+ * Transfer time estimation can be improved.
+
+## License
+
+Fastsync is licensed under the [Apache 2.0 License][apache2]. A copy of the
+license is included in the root of the repository.
+
+[apache2]: https://www.apache.org/licenses/LICENSE-2.0
+[tcp-hol]: https://github.com/rmarx/holblocking-blogpost/blob/a128994e32c134c5af6eb30120e321806cd6a4a3/README.md#tcp-hol-blocking

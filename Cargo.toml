@@ -1,7 +1,10 @@
 [package]
 name = "fastsync"
+authors = ["Chorus One <techops@chorus.one>"]
 version = "0.1.0"
+license = "Apache-2.0"
 edition = "2021"
+publish = false
 
 [dependencies]
 libc = "0.2.153"
@@ -12,3 +15,4 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
+strip = true
