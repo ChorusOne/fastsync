@@ -41,6 +41,7 @@ Receiver options:
                    to 32 is probably overkill.
 ";
 
+const WIRE_PROTO_VERSION: u16 = 1;
 const MAX_CHUNK_LEN: u64 = 4096 * 64;
 
 /// Metadata about all the files we want to transfer.
@@ -51,7 +52,7 @@ const MAX_CHUNK_LEN: u64 = 4096 * 64;
 /// The plan is tiny compared to the data and we assume we’re not dealing with
 /// malicious senders or receivers, so it doesn’t matter so much.
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
-struct TransferPlan(Vec<FilePlan>);
+struct TransferPlan(u16, Vec<FilePlan>);
 
 /// Metadata about a file to transfer.
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
@@ -64,7 +65,7 @@ impl TransferPlan {
     /// Ask the user if they're okay (over)writing the target files.
     fn ask_confirm_receive(&self) -> Result<()> {
         println!("  SIZE_BYTES  FILENAME");
-        for file in &self.0 {
+        for file in &self.1 {
             println!("{:>12}  {}", file.len, file.name);
         }
         print!("Receiving will overwrite existing files with those names. Continue? [y/N] ");
@@ -83,7 +84,7 @@ impl TransferPlan {
     /// even then, if that list can include `/etc/ssh/sshd_config` or something,
     /// that could be pretty disastrous. Only allow relative paths.
     fn assert_paths_relative(&self) {
-        for file in &self.0 {
+        for file in &self.1 {
             assert!(
                 !file.name.starts_with("/"),
                 "Transferring files with an absolute path name is not allowed.",
@@ -111,12 +112,12 @@ fn main() {
         Some("send") if args.len() >= 3 => {
             let addr = &args[1];
             let fnames = &args[2..];
-            main_send(addr, fnames).expect("Failed to send.");
+            main_send(addr, fnames, WIRE_PROTO_VERSION).expect("Failed to send.");
         }
         Some("recv") if args.len() == 3 => {
             let addr = &args[1];
             let n_conn = &args[2];
-            main_recv(addr, n_conn).expect("Failed to receive.");
+            main_recv(addr, n_conn, true, WIRE_PROTO_VERSION).expect("Failed to receive.");
         }
         _ => eprintln!("{}", USAGE),
     }
@@ -212,8 +213,8 @@ impl SendState {
     }
 }
 
-fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
-    let mut plan = TransferPlan(Vec::new());
+fn main_send(addr: &str, fnames: &[String], protocol_version: u16) -> Result<()> {
+    let mut plan = TransferPlan(protocol_version, Vec::new());
     let mut send_states = Vec::new();
 
     for (i, fname) in fnames.iter().enumerate() {
@@ -229,7 +230,7 @@ fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
             offset: AtomicU64::new(0),
             in_file: file,
         };
-        plan.0.push(file_plan);
+        plan.1.push(file_plan);
         send_states.push(state);
     }
 
@@ -371,7 +372,12 @@ impl FileReceiver {
     }
 }
 
-fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
+fn main_recv(
+    addr: &str,
+    n_conn: &str,
+    ask_for_confirmation: bool,
+    protocol_version: u16,
+) -> Result<()> {
     let n_connections: u32 = u32::from_str(n_conn).expect("Failed to parse number of connections.");
 
     // First we initiate one connection. The sender will send the plan over
@@ -379,7 +385,18 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
     // remaining reads, but the header is tiny so it should be okay.
     let mut stream = TcpStream::connect(addr)?;
     let plan = TransferPlan::deserialize_reader(&mut stream)?;
-    plan.ask_confirm_receive()?;
+    if plan.0 != protocol_version {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "Sender is version {} and we only support {WIRE_PROTO_VERSION}",
+                plan.0
+            ),
+        ));
+    }
+    if ask_for_confirmation {
+        plan.ask_confirm_receive()?;
+    }
 
     // The pull threads are going to receive chunks and push them into this
     // channel. Then we have one IO writer thread that either parks the chunks
@@ -389,8 +406,8 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
     let (sender, receiver) = mpsc::sync_channel::<Chunk>(16);
 
     let writer_thread = std::thread::spawn::<_, ()>(move || {
-        let total_len: u64 = plan.0.iter().map(|f| f.len).sum();
-        let mut files: Vec<_> = plan.0.into_iter().map(FileReceiver::new).collect();
+        let total_len: u64 = plan.1.iter().map(|f| f.len).sum();
+        let mut files: Vec<_> = plan.1.into_iter().map(FileReceiver::new).collect();
 
         let start_time = Instant::now();
         let mut bytes_received: u64 = 0;
@@ -494,4 +511,39 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
     writer_thread.join().expect("Failed to join writer thread.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{thread, time::Duration};
+
+    #[test]
+    fn test_accepts_valid_protocol() {
+        thread::spawn(|| {
+            std::fs::File::create("a-file").unwrap();
+            main_send("127.0.0.1:1234", &["a-file".into()], 1).unwrap();
+        });
+        thread::sleep(Duration::from_millis(100));
+
+        main_recv("127.0.0.1:1234", "1", false, 1).unwrap();
+    }
+
+    #[test]
+    fn test_refuses_invalid_protocol() {
+        thread::spawn(|| {
+            std::fs::File::create("a-file").unwrap();
+            main_send("127.0.0.1:3333", &["a-file".into()], 2).unwrap();
+        });
+        thread::sleep(Duration::from_millis(100));
+
+        let res = main_recv("127.0.0.1:3333", "1", false, 1);
+        match res {
+            Ok(()) => panic!("Expected failure"),
+            Err(e) => match e.kind() {
+                ErrorKind::InvalidData => (),
+                other => panic!("Expected InvalidData, got {other}"),
+            },
+        }
+    }
 }
