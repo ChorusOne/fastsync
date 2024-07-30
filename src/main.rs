@@ -5,6 +5,8 @@
 // you may not use this file except in compliance with the License.
 // A copy of the License has been included in the root of the repository.
 
+mod ratelimiter;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read, Result, Write};
@@ -14,8 +16,10 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use walkdir::WalkDir;
+
+use crate::ratelimiter::RateLimiter;
 
 use borsh::BorshDeserialize;
 use borsh::BorshSerialize;
@@ -139,7 +143,7 @@ fn main() {
             let max_bandwidth = match args[2].as_str() {
                 "--max-bandwidth" => Some(
                     args[3]
-                        .parse::<u32>()
+                        .parse::<u64>()
                         .expect("Invalid number for --max-bandwidth"),
                 ),
                 _ => None,
@@ -291,7 +295,7 @@ fn main_send(
     fnames: &[String],
     protocol_version: u16,
     sender_events: std::sync::mpsc::Sender<SenderEvent>,
-    max_bandwidth_mbps: Option<u32>,
+    max_bandwidth_mbps: Option<u64>,
 ) -> Result<()> {
     let mut plan = TransferPlan {
         proto_version: protocol_version,
@@ -354,35 +358,17 @@ fn main_send(
         }
 
         let state_clone = state_arc.clone();
+
         let push_thread = std::thread::spawn(move || {
-            let window_to_consider = Duration::from_millis(1000);
-            let mut last_offset = 0;
+            let mut rl = RateLimiter::new(MAX_CHUNK_LEN, max_bandwidth_mbps);
             let start_time = Instant::now();
             // All the threads iterate through all the files one by one, so all
             // the threads collaborate on sending the first one, then the second
             // one, etc.
-            let mut chunk_transfer_meta: Vec<(Instant, usize)> = Vec::new();
 
             'files: for file in state_clone.iter() {
                 'chunks: loop {
-                    if let Some(bw) = max_bandwidth_mbps {
-                        chunk_transfer_meta.retain(|&item| item.0.elapsed() < window_to_consider);
-                        let transferred_bytes = file.offset.load(Ordering::SeqCst) - last_offset;
-                        last_offset = file.offset.load(Ordering::SeqCst);
-                        chunk_transfer_meta.push((Instant::now(), transferred_bytes as usize));
-                        let bytes_transferred_last_second: usize =
-                            chunk_transfer_meta.iter().map(|x| x.1).sum();
-                        let mb_per_sec = bytes_transferred_last_second as f32 * 1e-6;
-
-                        let bw_has_likely_settled = start_time.elapsed().as_millis() > 500
-                            || chunk_transfer_meta.len() > 10;
-                        if mb_per_sec > bw as f32 && bw_has_likely_settled {
-                            let time_taken = chunk_transfer_meta[chunk_transfer_meta.len() - 1]
-                                .0
-                                .elapsed();
-                            std::thread::sleep(window_to_consider - time_taken);
-                        }
-                    }
+                    rl.block_until_available();
                     match file.send_one(start_time, &mut stream) {
                         Ok(SendResult::Progress) => continue 'chunks,
                         Ok(SendResult::Done) => continue 'files,
