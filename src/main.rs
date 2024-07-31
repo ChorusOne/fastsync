@@ -113,14 +113,14 @@ enum WriteMode {
     #[allow(dead_code)]
     Force,
 }
-enum SenderEvents {
+enum SenderEvent {
     Listening(u16),
 }
 
 fn main() {
     // Skip the program name.
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let (events_tx, _) = std::sync::mpsc::channel::<SenderEvents>();
+    let (events_tx, _) = std::sync::mpsc::channel::<SenderEvent>();
 
     match args.first().map(|s| &s[..]) {
         Some("send") if args.len() >= 3 => {
@@ -232,7 +232,7 @@ fn main_send(
     addr: &str,
     fnames: &[String],
     protocol_version: u16,
-    sender_events: std::sync::mpsc::Sender<SenderEvents>,
+    sender_events: std::sync::mpsc::Sender<SenderEvent>,
 ) -> Result<()> {
     let mut plan = TransferPlan {
         proto_version: protocol_version,
@@ -267,10 +267,10 @@ fn main_send(
 
     println!("Waiting for the receiver ...");
     sender_events
-        .send(SenderEvents::Listening(
+        .send(SenderEvent::Listening(
             listener.local_addr().unwrap().port(),
         ))
-        .map_err(|x| Error::new(ErrorKind::Other, x))?;
+        .expect("Listener should not exit before the sender.");
 
     loop {
         let (mut stream, addr) = listener.accept()?;
@@ -543,13 +543,13 @@ mod tests {
 
     #[test]
     fn test_accepts_valid_protocol() {
-        let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvents>();
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
         thread::spawn(|| {
             std::fs::File::create("a-file").unwrap();
             main_send("127.0.0.1:0", &["a-file".into()], 1, events_tx).unwrap();
         });
         match events_rx.recv().unwrap() {
-            SenderEvents::Listening(port) => {
+            SenderEvent::Listening(port) => {
                 main_recv(
                     format!("127.0.0.1:{port}").as_str(),
                     "1",
@@ -563,13 +563,13 @@ mod tests {
 
     #[test]
     fn test_refuses_invalid_protocol() {
-        let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvents>();
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
         thread::spawn(|| {
             std::fs::File::create("a-file").unwrap();
             main_send("127.0.0.1:0", &["a-file".into()], 2, events_tx).unwrap();
         });
         match events_rx.recv().unwrap() {
-            SenderEvents::Listening(port) => {
+            SenderEvent::Listening(port) => {
                 let res = main_recv(
                     format!("127.0.0.1:{port}").as_str(),
                     "1",
