@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read, Result, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::str::FromStr;
@@ -126,13 +126,24 @@ fn main() {
         Some("send") if args.len() >= 3 => {
             let addr = &args[1];
             let fnames = &args[2..];
-            main_send(addr, fnames, WIRE_PROTO_VERSION, events_tx).expect("Failed to send.");
+            main_send(
+                SocketAddr::from_str(addr).expect("Invalid send address"),
+                fnames,
+                WIRE_PROTO_VERSION,
+                events_tx,
+            )
+            .expect("Failed to send.");
         }
         Some("recv") if args.len() == 3 => {
             let addr = &args[1];
             let n_conn = &args[2];
-            main_recv(addr, n_conn, WriteMode::AskConfirm, WIRE_PROTO_VERSION)
-                .expect("Failed to receive.");
+            main_recv(
+                SocketAddr::from_str(addr).expect("Invalid recv address"),
+                n_conn,
+                WriteMode::AskConfirm,
+                WIRE_PROTO_VERSION,
+            )
+            .expect("Failed to receive.");
         }
         _ => eprintln!("{}", USAGE),
     }
@@ -230,7 +241,7 @@ impl SendState {
 }
 
 fn main_send(
-    addr: &str,
+    addr: SocketAddr,
     fnames: &[String],
     protocol_version: u16,
     sender_events: std::sync::mpsc::Sender<SenderEvent>,
@@ -401,7 +412,12 @@ impl FileReceiver {
     }
 }
 
-fn main_recv(addr: &str, n_conn: &str, write_mode: WriteMode, protocol_version: u16) -> Result<()> {
+fn main_recv(
+    addr: SocketAddr,
+    n_conn: &str,
+    write_mode: WriteMode,
+    protocol_version: u16,
+) -> Result<()> {
     let n_connections: u32 = u32::from_str(n_conn).expect("Failed to parse number of connections.");
 
     // First we initiate one connection. The sender will send the plan over
@@ -540,19 +556,28 @@ fn main_recv(addr: &str, n_conn: &str, write_mode: WriteMode, protocol_version: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        thread,
+    };
 
     #[test]
     fn test_accepts_valid_protocol() {
         let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
         thread::spawn(|| {
             std::fs::File::create("a-file").unwrap();
-            main_send("127.0.0.1:0", &["a-file".into()], 1, events_tx).unwrap();
+            main_send(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+                &["a-file".into()],
+                1,
+                events_tx,
+            )
+            .unwrap();
         });
         match events_rx.recv().unwrap() {
             SenderEvent::Listening(port) => {
                 main_recv(
-                    format!("127.0.0.1:{port}").as_str(),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
                     "1",
                     WriteMode::Force,
                     1,
@@ -567,12 +592,18 @@ mod tests {
         let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
         thread::spawn(|| {
             std::fs::File::create("a-file").unwrap();
-            main_send("127.0.0.1:0", &["a-file".into()], 2, events_tx).unwrap();
+            main_send(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+                &["a-file".into()],
+                2,
+                events_tx,
+            )
+            .unwrap();
         });
         match events_rx.recv().unwrap() {
             SenderEvent::Listening(port) => {
                 let res = main_recv(
-                    format!("127.0.0.1:{port}").as_str(),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
                     "1",
                     WriteMode::Force,
                     1,
