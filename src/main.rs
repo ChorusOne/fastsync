@@ -113,21 +113,26 @@ enum WriteMode {
     #[allow(dead_code)]
     Force,
 }
+enum SenderEvents {
+    Listening(u16),
+}
 
 fn main() {
     // Skip the program name.
     let args: Vec<_> = std::env::args().skip(1).collect();
+    let (events_tx, _) = std::sync::mpsc::channel::<SenderEvents>();
 
     match args.first().map(|s| &s[..]) {
         Some("send") if args.len() >= 3 => {
             let addr = &args[1];
             let fnames = &args[2..];
-            main_send(addr, fnames, WIRE_PROTO_VERSION).expect("Failed to send.");
+            main_send(addr, fnames, WIRE_PROTO_VERSION, events_tx).expect("Failed to send.");
         }
         Some("recv") if args.len() == 3 => {
             let addr = &args[1];
             let n_conn = &args[2];
-            main_recv(addr, n_conn, WriteMode::AskConfirm, WIRE_PROTO_VERSION).expect("Failed to receive.");
+            main_recv(addr, n_conn, WriteMode::AskConfirm, WIRE_PROTO_VERSION)
+                .expect("Failed to receive.");
         }
         _ => eprintln!("{}", USAGE),
     }
@@ -223,7 +228,12 @@ impl SendState {
     }
 }
 
-fn main_send(addr: &str, fnames: &[String], protocol_version: u16) -> Result<()> {
+fn main_send(
+    addr: &str,
+    fnames: &[String],
+    protocol_version: u16,
+    sender_events: std::sync::mpsc::Sender<SenderEvents>,
+) -> Result<()> {
     let mut plan = TransferPlan {
         proto_version: protocol_version,
         files: Vec::new(),
@@ -256,6 +266,11 @@ fn main_send(addr: &str, fnames: &[String], protocol_version: u16) -> Result<()>
     let listener = std::net::TcpListener::bind(addr)?;
 
     println!("Waiting for the receiver ...");
+    sender_events
+        .send(SenderEvents::Listening(
+            listener.local_addr().unwrap().port(),
+        ))
+        .map_err(|x| Error::new(ErrorKind::Other, x))?;
 
     loop {
         let (mut stream, addr) = listener.accept()?;
@@ -524,28 +539,48 @@ fn main_recv(addr: &str, n_conn: &str, write_mode: WriteMode, protocol_version: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{thread, time::Duration};
+    use std::thread;
 
     #[test]
     fn test_accepts_valid_protocol() {
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvents>();
         thread::spawn(|| {
             std::fs::File::create("a-file").unwrap();
-            main_send("127.0.0.1:1234", &["a-file".into()], 1).unwrap();
+            main_send("127.0.0.1:0", &["a-file".into()], 1, events_tx).unwrap();
         });
-        thread::sleep(Duration::from_millis(100));
-
-        main_recv("127.0.0.1:1234", "1", false, 1).unwrap();
+        match events_rx.recv().unwrap() {
+            SenderEvents::Listening(port) => {
+                main_recv(
+                    format!("127.0.0.1:{port}").as_str(),
+                    "1",
+                    WriteMode::Force,
+                    1,
+                )
+                .unwrap();
+            }
+        }
     }
 
     #[test]
     fn test_refuses_invalid_protocol() {
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvents>();
         thread::spawn(|| {
             std::fs::File::create("a-file").unwrap();
-            main_send("127.0.0.1:3333", &["a-file".into()], 2).unwrap();
+            main_send("127.0.0.1:0", &["a-file".into()], 2, events_tx).unwrap();
         });
-        thread::sleep(Duration::from_millis(100));
-
-        let res = main_recv("127.0.0.1:3333", "1", false, 1);
-        assert_eq!(res.err().expect("Expected failure").kind(), ErrorKind::InvalidData);
+        match events_rx.recv().unwrap() {
+            SenderEvents::Listening(port) => {
+                let res = main_recv(
+                    format!("127.0.0.1:{port}").as_str(),
+                    "1",
+                    WriteMode::Force,
+                    1,
+                );
+                assert_eq!(
+                    res.err().expect("Expected failure").kind(),
+                    ErrorKind::InvalidData
+                );
+            }
+        }
     }
 }
