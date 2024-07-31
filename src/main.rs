@@ -120,7 +120,7 @@ enum SenderEvent {
 fn main() {
     // Skip the program name.
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let (events_tx, _) = std::sync::mpsc::channel::<SenderEvent>();
+    let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
 
     match args.first().map(|s| &s[..]) {
         Some("send") if args.len() >= 3 => {
@@ -136,6 +136,7 @@ fn main() {
         }
         _ => eprintln!("{}", USAGE),
     }
+    drop(events_rx);
 }
 
 fn print_progress(offset: u64, len: u64, start_time: Instant) {
