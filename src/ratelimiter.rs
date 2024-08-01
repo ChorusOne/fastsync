@@ -12,7 +12,7 @@ impl RateLimiter {
     pub(crate) fn new(chunk_size_bytes: u64, mbps_target: Option<u64>) -> Self {
         let bps_target = mbps_target.map(|x| x * 1_000_000);
         let tokens_per_second = match bps_target {
-            None => 1.0,
+            None => 0.0,
             Some(bps) => bps as f32 / chunk_size_bytes as f32,
         };
         RateLimiter {
