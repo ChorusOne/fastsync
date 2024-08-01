@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read, Result, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::str::FromStr;
@@ -48,6 +48,7 @@ Receiver options:
                    to 32 is probably overkill.
 ";
 
+const WIRE_PROTO_VERSION: u16 = 1;
 const MAX_CHUNK_LEN: u64 = 4096 * 64;
 
 /// Metadata about all the files we want to transfer.
@@ -58,7 +59,10 @@ const MAX_CHUNK_LEN: u64 = 4096 * 64;
 /// The plan is tiny compared to the data and we assume we’re not dealing with
 /// malicious senders or receivers, so it doesn’t matter so much.
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
-struct TransferPlan(Vec<FilePlan>);
+struct TransferPlan {
+    proto_version: u16,
+    files: Vec<FilePlan>,
+}
 
 /// Metadata about a file to transfer.
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
@@ -71,7 +75,7 @@ impl TransferPlan {
     /// Ask the user if they're okay (over)writing the target files.
     fn ask_confirm_receive(&self) -> Result<()> {
         println!("  SIZE_BYTES  FILENAME");
-        for file in &self.0 {
+        for file in &self.files {
             println!("{:>12}  {}", file.len, file.name);
         }
         print!("Receiving will overwrite existing files with those names. Continue? [y/N] ");
@@ -90,7 +94,7 @@ impl TransferPlan {
     /// even then, if that list can include `/etc/ssh/sshd_config` or something,
     /// that could be pretty disastrous. Only allow relative paths.
     fn assert_paths_relative(&self) {
-        for file in &self.0 {
+        for file in &self.files {
             assert!(
                 !file.name.starts_with("/"),
                 "Transferring files with an absolute path name is not allowed.",
@@ -110,23 +114,47 @@ impl FileId {
     }
 }
 
+#[derive(PartialEq)]
+enum WriteMode {
+    AskConfirm,
+    #[allow(dead_code)]
+    Force,
+}
+enum SenderEvent {
+    Listening(u16),
+}
+
 fn main() {
     // Skip the program name.
     let args: Vec<_> = std::env::args().skip(1).collect();
+    let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
 
     match args.first().map(|s| &s[..]) {
         Some("send") if args.len() >= 3 => {
             let addr = &args[1];
             let fnames = &args[2..];
-            main_send(addr, fnames).expect("Failed to send.");
+            main_send(
+                SocketAddr::from_str(addr).expect("Invalid send address"),
+                fnames,
+                WIRE_PROTO_VERSION,
+                events_tx,
+            )
+            .expect("Failed to send.");
         }
         Some("recv") if args.len() == 3 => {
             let addr = &args[1];
             let n_conn = &args[2];
-            main_recv(addr, n_conn).expect("Failed to receive.");
+            main_recv(
+                SocketAddr::from_str(addr).expect("Invalid recv address"),
+                n_conn,
+                WriteMode::AskConfirm,
+                WIRE_PROTO_VERSION,
+            )
+            .expect("Failed to receive.");
         }
         _ => eprintln!("{}", USAGE),
     }
+    drop(events_rx);
 }
 
 fn print_progress(offset: u64, len: u64, start_time: Instant) {
@@ -219,8 +247,16 @@ impl SendState {
     }
 }
 
-fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
-    let mut plan = TransferPlan(Vec::new());
+fn main_send(
+    addr: SocketAddr,
+    fnames: &[String],
+    protocol_version: u16,
+    sender_events: std::sync::mpsc::Sender<SenderEvent>,
+) -> Result<()> {
+    let mut plan = TransferPlan {
+        proto_version: protocol_version,
+        files: Vec::new(),
+    };
     let mut send_states = Vec::new();
 
     for (i, fname) in fnames.iter().enumerate() {
@@ -236,7 +272,7 @@ fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
             offset: AtomicU64::new(0),
             in_file: file,
         };
-        plan.0.push(file_plan);
+        plan.files.push(file_plan);
         send_states.push(state);
     }
 
@@ -249,6 +285,11 @@ fn main_send(addr: &str, fnames: &[String]) -> Result<()> {
     let listener = std::net::TcpListener::bind(addr)?;
 
     println!("Waiting for the receiver ...");
+    sender_events
+        .send(SenderEvent::Listening(
+            listener.local_addr().unwrap().port(),
+        ))
+        .expect("Listener should not exit before the sender.");
 
     loop {
         let (mut stream, addr) = listener.accept()?;
@@ -378,7 +419,12 @@ impl FileReceiver {
     }
 }
 
-fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
+fn main_recv(
+    addr: SocketAddr,
+    n_conn: &str,
+    write_mode: WriteMode,
+    protocol_version: u16,
+) -> Result<()> {
     let n_connections: u32 = u32::from_str(n_conn).expect("Failed to parse number of connections.");
 
     // First we initiate one connection. The sender will send the plan over
@@ -386,7 +432,18 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
     // remaining reads, but the header is tiny so it should be okay.
     let mut stream = TcpStream::connect(addr)?;
     let plan = TransferPlan::deserialize_reader(&mut stream)?;
-    plan.ask_confirm_receive()?;
+    if plan.proto_version != protocol_version {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "Sender is version {} and we only support {WIRE_PROTO_VERSION}",
+                plan.proto_version
+            ),
+        ));
+    }
+    if write_mode == WriteMode::AskConfirm {
+        plan.ask_confirm_receive()?;
+    }
 
     // The pull threads are going to receive chunks and push them into this
     // channel. Then we have one IO writer thread that either parks the chunks
@@ -396,8 +453,8 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
     let (sender, receiver) = mpsc::sync_channel::<Chunk>(16);
 
     let writer_thread = std::thread::spawn::<_, ()>(move || {
-        let total_len: u64 = plan.0.iter().map(|f| f.len).sum();
-        let mut files: Vec<_> = plan.0.into_iter().map(FileReceiver::new).collect();
+        let total_len: u64 = plan.files.iter().map(|f| f.len).sum();
+        let mut files: Vec<_> = plan.files.into_iter().map(FileReceiver::new).collect();
 
         let start_time = Instant::now();
         let mut bytes_received: u64 = 0;
@@ -501,4 +558,68 @@ fn main_recv(addr: &str, n_conn: &str) -> Result<()> {
     writer_thread.join().expect("Failed to join writer thread.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        thread,
+    };
+
+    #[test]
+    fn test_accepts_valid_protocol() {
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
+        thread::spawn(|| {
+            std::fs::File::create("a-file").unwrap();
+            main_send(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+                &["a-file".into()],
+                1,
+                events_tx,
+            )
+            .unwrap();
+        });
+        match events_rx.recv().unwrap() {
+            SenderEvent::Listening(port) => {
+                main_recv(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
+                    "1",
+                    WriteMode::Force,
+                    1,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_refuses_invalid_protocol() {
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
+        thread::spawn(|| {
+            std::fs::File::create("a-file").unwrap();
+            main_send(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+                &["a-file".into()],
+                2,
+                events_tx,
+            )
+            .unwrap();
+        });
+        match events_rx.recv().unwrap() {
+            SenderEvent::Listening(port) => {
+                let res = main_recv(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
+                    "1",
+                    WriteMode::Force,
+                    1,
+                );
+                assert_eq!(
+                    res.err().expect("Expected failure").kind(),
+                    ErrorKind::InvalidData
+                );
+            }
+        }
+    }
 }
