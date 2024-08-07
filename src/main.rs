@@ -15,6 +15,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
+use walkdir::WalkDir;
 
 use borsh::BorshDeserialize;
 use borsh::BorshSerialize;
@@ -247,6 +248,28 @@ impl SendState {
     }
 }
 
+fn all_filenames_from_path_names(fnames: &[String]) -> Result<Vec<String>> {
+    let mut all_files = Vec::with_capacity(fnames.len());
+
+    for fname in fnames {
+        let metadata = std::fs::metadata(fname)
+            .map_err(|e| Error::new(e.kind(), format!("Unable to access '{fname}'")))?;
+
+        if metadata.is_file() {
+            all_files.push(fname.to_owned());
+        } else if metadata.is_dir() {
+            all_files.extend(
+                WalkDir::new(fname)
+                    .into_iter()
+                    .filter_map(|x| x.ok())
+                    .filter(|e| e.file_type().is_file())
+                    .filter_map(|e| e.path().to_str().map(String::from)),
+            );
+        }
+    }
+    Ok(all_files)
+}
+
 fn main_send(
     addr: SocketAddr,
     fnames: &[String],
@@ -259,8 +282,8 @@ fn main_send(
     };
     let mut send_states = Vec::new();
 
-    for (i, fname) in fnames.iter().enumerate() {
-        let file = std::fs::File::open(fname)?;
+    for (i, fname) in all_filenames_from_path_names(fnames)?.iter().enumerate() {
+        let file = std::fs::File::open(&fname)?;
         let metadata = file.metadata()?;
         let file_plan = FilePlan {
             name: fname.clone(),
@@ -621,5 +644,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_walk_paths_recursively() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base_path = temp_dir.path();
+        std::fs::create_dir_all(base_path.join("a/b")).unwrap();
+        File::create(base_path.join("0")).unwrap();
+        File::create(base_path.join("a/1")).unwrap();
+        File::create(base_path.join("a/b/2")).unwrap();
+
+        let mut res =
+            all_filenames_from_path_names(&[base_path.to_str().unwrap().to_owned()]).unwrap();
+        res.sort();
+
+        assert_eq!(
+            res,
+            ["0", "a/1", "a/b/2"].map(|f| base_path.join(f).to_str().unwrap().to_owned())
+        );
     }
 }
