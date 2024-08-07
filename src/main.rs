@@ -248,11 +248,12 @@ impl SendState {
     }
 }
 
-fn all_filenames_from_path_names(fnames: &[String]) -> Vec<String> {
+fn all_filenames_from_path_names(fnames: &[String]) -> Result<Vec<String>> {
     let mut all_files = Vec::with_capacity(fnames.len());
 
     for fname in fnames {
-        let metadata = std::fs::metadata(fname).unwrap();
+        let metadata = std::fs::metadata(fname)
+            .map_err(|e| Error::new(e.kind(), format!("Unable to access '{fname}'")))?;
 
         if metadata.is_file() {
             all_files.push(fname.to_owned());
@@ -266,7 +267,7 @@ fn all_filenames_from_path_names(fnames: &[String]) -> Vec<String> {
             );
         }
     }
-    all_files
+    Ok(all_files)
 }
 
 fn main_send(
@@ -281,7 +282,7 @@ fn main_send(
     };
     let mut send_states = Vec::new();
 
-    for (i, fname) in all_filenames_from_path_names(fnames).iter().enumerate() {
+    for (i, fname) in all_filenames_from_path_names(fnames)?.iter().enumerate() {
         let file = std::fs::File::open(&fname)?;
         let metadata = file.metadata()?;
         let file_plan = FilePlan {
@@ -654,7 +655,8 @@ mod tests {
         File::create(base_path.join("a/1")).unwrap();
         File::create(base_path.join("a/b/2")).unwrap();
 
-        let mut res = all_filenames_from_path_names(&[base_path.to_str().unwrap().to_owned()]);
+        let mut res =
+            all_filenames_from_path_names(&[base_path.to_str().unwrap().to_owned()]).unwrap();
         res.sort();
 
         assert_eq!(
