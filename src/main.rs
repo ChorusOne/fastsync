@@ -31,29 +31,29 @@ Usage:
   fastsync recv <server-addr> <num-streams>
 
 Sender options:
-  <listen-addr>             Address (IP and port) for the sending side to bind to and
-                            listen for receivers. This should be the address of a
-                            Wireguard interface if you care about confidentiality.
-                            E.g. '100.71.154.83:7999'.
+  <listen-addr>                  Address (IP and port) for the sending side to bind to and
+                                 listen for receivers. This should be the address of a
+                                 Wireguard interface if you care about confidentiality.
+                                 E.g. '100.71.154.83:7999'.
 
-  [--max-bandwidth <MBps>]  Specify the maximum bandwidth to use over a 1 second sliding
-                            window, in MB/s. If unspecified, there will be no limit.
+  [--max-bandwidth-mbps <MBps>]  Specify the maximum bandwidth to use over a 1 second sliding
+                                 window, in MB/s. If unspecified, there will be no limit.
 
-  <in-files...>             Paths of files to send. Input file paths need to be relative.
-                            This is a safety measure to make it harder to accidentally
-                            overwrite files in /etc and the like on the receiving end.
+  <in-files...>                  Paths of files to send. Input file paths need to be relative.
+                                 This is a safety measure to make it harder to accidentally
+                                 overwrite files in /etc and the like on the receiving end.
 
 Receiver options:
-  <server-addr>             The address (IP and port) that the sender is listening on.
-                            E.g. '100.71.154.83:7999'.
+  <server-addr>                  The address (IP and port) that the sender is listening on.
+                                 E.g. '100.71.154.83:7999'.
 
-  <num-streams>             The number of TCP streams to open. For a value of 1, Fastsync
-                            behaves very similar to 'netcat'. With higher values,
-                            Fastsync leverages the fact that file chunks don't need to
-                            arrive in order to avoid the head-of-line blocking of a
-                            single connection. You should experiment to find the best
-                            value, going from 1 to 4 is usually helpful, going from 16
-                            to 32 is probably overkill.
+  <num-streams>                  The number of TCP streams to open. For a value of 1, Fastsync
+                                 behaves very similar to 'netcat'. With higher values,
+                                 Fastsync leverages the fact that file chunks don't need to
+                                 arrive in order to avoid the head-of-line blocking of a
+                                 single connection. You should experiment to find the best
+                                 value, going from 1 to 4 is usually helpful, going from 16
+                                 to 32 is probably overkill.
 ";
 
 const WIRE_PROTO_VERSION: u16 = 1;
@@ -141,10 +141,10 @@ fn main() {
         Some("send") if args.len() >= 3 => {
             let addr = &args[1];
             let max_bandwidth = match args[2].as_str() {
-                "--max-bandwidth" => Some(
+                "--max-bandwidth-mbps" => Some(
                     args[3]
                         .parse::<u64>()
-                        .expect("Invalid number for --max-bandwidth"),
+                        .expect("Invalid number for --max-bandwidth-mbps"),
                 ),
                 _ => None,
             };
