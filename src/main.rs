@@ -15,7 +15,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 use walkdir::WalkDir;
 
@@ -335,6 +335,10 @@ fn main_send(
         ))
         .expect("Listener should not exit before the sender.");
 
+    let rl = Arc::new(Mutex::new(RateLimiter::new(
+        MAX_CHUNK_LEN,
+        max_bandwidth_mbps,
+    )));
     loop {
         let (mut stream, addr) = listener.accept()?;
         println!("Accepted connection from {addr}.");
@@ -359,8 +363,8 @@ fn main_send(
 
         let state_clone = state_arc.clone();
 
+        let rl_clone = rl.clone();
         let push_thread = std::thread::spawn(move || {
-            let mut rl = RateLimiter::new(MAX_CHUNK_LEN, max_bandwidth_mbps);
             let start_time = Instant::now();
             // All the threads iterate through all the files one by one, so all
             // the threads collaborate on sending the first one, then the second
@@ -368,7 +372,7 @@ fn main_send(
 
             'files: for file in state_clone.iter() {
                 'chunks: loop {
-                    rl.block_until_available();
+                    rl_clone.lock().unwrap().block_until_available();
                     match file.send_one(start_time, &mut stream) {
                         Ok(SendResult::Progress) => continue 'chunks,
                         Ok(SendResult::Done) => continue 'files,
