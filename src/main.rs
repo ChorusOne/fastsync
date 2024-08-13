@@ -335,10 +335,13 @@ fn main_send(
         ))
         .expect("Listener should not exit before the sender.");
 
-    let rl = Arc::new(Mutex::new(RateLimiter::new(
-        MAX_CHUNK_LEN,
-        max_bandwidth_mbps,
-    )));
+    let rl = Arc::new(Mutex::new(Option::<RateLimiter>::None));
+
+    if let Some(mbps) = max_bandwidth_mbps {
+        let _rl = RateLimiter::new(mbps, Instant::now());
+        _ = rl.lock().unwrap().insert(_rl);
+    }
+
     loop {
         let (mut stream, addr) = listener.accept()?;
         println!("Accepted connection from {addr}.");
@@ -372,7 +375,11 @@ fn main_send(
 
             'files: for file in state_clone.iter() {
                 'chunks: loop {
-                    rl_clone.lock().unwrap().block_until_available();
+                    if let Some(rl) = rl_clone.lock().unwrap().as_mut() {
+                        let to_wait = rl.time_until_bytes_available(Instant::now(), MAX_CHUNK_LEN);
+                        std::thread::sleep(to_wait);
+                        rl.consume_bytes(Instant::now(), MAX_CHUNK_LEN);
+                    }
                     match file.send_one(start_time, &mut stream) {
                         Ok(SendResult::Progress) => continue 'chunks,
                         Ok(SendResult::Done) => continue 'files,
