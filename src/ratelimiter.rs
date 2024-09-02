@@ -11,7 +11,7 @@ impl RateLimiter {
     pub fn new(mbps_target: u64, now: Instant) -> Self {
         let bps_target = mbps_target * 1_000_000;
         RateLimiter {
-            available_bytes: 0,
+            available_bytes: bps_target,
             bytes_per_second: bps_target,
             last_update: now,
         }
@@ -57,8 +57,8 @@ mod tests {
         let start = Instant::now();
         let rl = RateLimiter::new(10, start);
 
-        assert_eq!(rl.bytes_available(start), 0);
         assert_eq!(rl.bytes_per_second, 10_000_000);
+        assert_eq!(rl.bytes_available(start), rl.bytes_per_second);
     }
 
     #[test]
