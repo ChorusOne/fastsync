@@ -2,16 +2,18 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub struct RateLimiter {
+    capacity_bytes: u64,
     available_bytes: u64,
     bytes_per_second: u64,
     last_update: Instant,
 }
 
 impl RateLimiter {
-    pub fn new(mbps_target: u64, now: Instant) -> Self {
+    pub fn new(mbps_target: u64, capacity_bytes: u64, now: Instant) -> Self {
         let bps_target = mbps_target * 1_000_000;
         RateLimiter {
-            available_bytes: bps_target,
+            capacity_bytes,
+            available_bytes: capacity_bytes,
             bytes_per_second: bps_target,
             last_update: now,
         }
@@ -20,17 +22,15 @@ impl RateLimiter {
     pub fn bytes_available(&self, now: Instant) -> u64 {
         let elapsed = now - self.last_update;
         let new_bytes = elapsed.as_secs_f32() * self.bytes_per_second as f32;
-        std::cmp::min(
-            self.available_bytes + new_bytes as u64,
-            self.bytes_per_second,
-        )
+        std::cmp::min(self.available_bytes + new_bytes as u64, self.capacity_bytes)
     }
 
     pub fn consume_bytes(&mut self, now: Instant, amount: u64) {
         let elapsed = now - self.last_update;
         let new_bytes = (elapsed.as_secs_f32() * self.bytes_per_second as f32) as u64;
         self.available_bytes += new_bytes;
-        self.available_bytes = std::cmp::min(self.available_bytes, self.bytes_per_second);
+        self.available_bytes = std::cmp::min(self.available_bytes, self.capacity_bytes);
+        assert!(self.available_bytes >= amount);
         self.available_bytes -= amount;
         self.last_update = now;
     }
@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn test_initial_state() {
         let start = Instant::now();
-        let rl = RateLimiter::new(10, start);
+        let rl = RateLimiter::new(10, 10_000_000, start);
 
         assert_eq!(rl.bytes_per_second, 10_000_000);
         assert_eq!(rl.bytes_available(start), rl.bytes_per_second);
@@ -64,7 +64,7 @@ mod tests {
     #[test]
     fn test_bytes_available_after_one_second() {
         let start = Instant::now();
-        let rl = RateLimiter::new(10, start);
+        let rl = RateLimiter::new(10, 10_000_000, start);
 
         let now = start + Duration::from_secs(1);
         assert_eq!(rl.bytes_available(now), 10_000_000);
@@ -73,7 +73,7 @@ mod tests {
     #[test]
     fn test_consume_bytes() {
         let start = Instant::now();
-        let mut rl = RateLimiter::new(10, start);
+        let mut rl = RateLimiter::new(10, 10_000_000, start);
 
         let now = start + Duration::from_secs(1);
         assert_eq!(rl.bytes_available(now), 10_000_000);
@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn test_bytes_available_capped_at_max() {
         let start = Instant::now();
-        let mut rl = RateLimiter::new(10, start);
+        let mut rl = RateLimiter::new(10, 10_000_000, start);
 
         let now = start + Duration::from_secs(1);
         rl.consume_bytes(now, 5_000_000);
@@ -99,7 +99,7 @@ mod tests {
     #[test]
     fn test_time_until_bytes_available() {
         let start = Instant::now();
-        let mut rl = RateLimiter::new(10, start);
+        let mut rl = RateLimiter::new(10, 10_000_000, start);
 
         let now = start + Duration::from_secs(1);
         rl.consume_bytes(now, 9_000_000);
@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn test_immediate_availability() {
         let start = Instant::now();
-        let mut rl = RateLimiter::new(10, start);
+        let mut rl = RateLimiter::new(10, 10_000_000, start);
 
         let now = start + Duration::from_secs(1);
         rl.consume_bytes(now, 9_000_000);
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn test_long_wait_time() {
         let start = Instant::now();
-        let mut rl = RateLimiter::new(10, start);
+        let mut rl = RateLimiter::new(10, 10_000_000, start);
 
         let now = start + Duration::from_secs(1);
         rl.consume_bytes(now, 9_000_000);

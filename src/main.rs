@@ -342,7 +342,7 @@ fn main_send(
     let limiter_mutex = Arc::new(Mutex::new(Option::<RateLimiter>::None));
 
     if let Some(mbps) = max_bandwidth_mbps {
-        let ratelimiter = RateLimiter::new(mbps, Instant::now());
+        let ratelimiter = RateLimiter::new(mbps, MAX_CHUNK_LEN, Instant::now());
         _ = limiter_mutex.lock().unwrap().insert(ratelimiter);
     }
 
