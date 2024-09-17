@@ -199,7 +199,7 @@ struct SendState {
 
 enum SendResult {
     Done,
-    Progress,
+    Progress { bytes_sent: u64 },
 }
 
 /// Metadata about a chunk of data that follows.
@@ -254,6 +254,7 @@ impl SendState {
         let mut off = offset as i64;
         let out_fd = out.as_raw_fd();
         let in_fd = self.in_file.as_raw_fd();
+        let mut total_written: u64 = 0;
         while off < end {
             let count = (end - off) as usize;
             // Note, sendfile advances the offset by the number of bytes written
@@ -262,9 +263,12 @@ impl SendState {
             if n_written < 0 {
                 return Err(Error::last_os_error());
             }
+            total_written += n_written as u64;
         }
 
-        Ok(SendResult::Progress)
+        Ok(SendResult::Progress {
+            bytes_sent: total_written,
+        })
     }
 }
 
@@ -375,14 +379,22 @@ fn main_send(
 
             'files: for file in state_clone.iter() {
                 'chunks: loop {
-                    if let Some(ratelimiter) = limiter_mutex_2.lock().unwrap().as_mut() {
+                    let mut limiter_mutex = limiter_mutex_2.lock().unwrap();
+                    let mut opt_ratelimiter = limiter_mutex.as_mut();
+                    if let Some(ref mut ratelimiter) = opt_ratelimiter {
                         let to_wait =
                             ratelimiter.time_until_bytes_available(Instant::now(), MAX_CHUNK_LEN);
                         std::thread::sleep(to_wait);
-                        ratelimiter.consume_bytes(Instant::now(), MAX_CHUNK_LEN);
                     }
                     match file.send_one(start_time, &mut stream) {
-                        Ok(SendResult::Progress) => continue 'chunks,
+                        Ok(SendResult::Progress {
+                            bytes_sent: bytes_written,
+                        }) => {
+                            if let Some(ref mut ratelimiter) = opt_ratelimiter {
+                                ratelimiter.consume_bytes(Instant::now(), bytes_written);
+                            }
+                            continue 'chunks;
+                        }
                         Ok(SendResult::Done) => continue 'files,
                         Err(err) => panic!("Failed to send: {err}"),
                     }
