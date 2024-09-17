@@ -335,11 +335,11 @@ fn main_send(
         ))
         .expect("Listener should not exit before the sender.");
 
-    let rl = Arc::new(Mutex::new(Option::<RateLimiter>::None));
+    let limiter_mutex = Arc::new(Mutex::new(Option::<RateLimiter>::None));
 
     if let Some(mbps) = max_bandwidth_mbps {
-        let _rl = RateLimiter::new(mbps, Instant::now());
-        _ = rl.lock().unwrap().insert(_rl);
+        let ratelimiter = RateLimiter::new(mbps, Instant::now());
+        _ = limiter_mutex.lock().unwrap().insert(ratelimiter);
     }
 
     loop {
@@ -366,7 +366,7 @@ fn main_send(
 
         let state_clone = state_arc.clone();
 
-        let rl_clone = rl.clone();
+        let limiter_mutex_2 = limiter_mutex.clone();
         let push_thread = std::thread::spawn(move || {
             let start_time = Instant::now();
             // All the threads iterate through all the files one by one, so all
@@ -375,10 +375,11 @@ fn main_send(
 
             'files: for file in state_clone.iter() {
                 'chunks: loop {
-                    if let Some(rl) = rl_clone.lock().unwrap().as_mut() {
-                        let to_wait = rl.time_until_bytes_available(Instant::now(), MAX_CHUNK_LEN);
+                    if let Some(ratelimiter) = limiter_mutex_2.lock().unwrap().as_mut() {
+                        let to_wait =
+                            ratelimiter.time_until_bytes_available(Instant::now(), MAX_CHUNK_LEN);
                         std::thread::sleep(to_wait);
-                        rl.consume_bytes(Instant::now(), MAX_CHUNK_LEN);
+                        ratelimiter.consume_bytes(Instant::now(), MAX_CHUNK_LEN);
                     }
                     match file.send_one(start_time, &mut stream) {
                         Ok(SendResult::Progress) => continue 'chunks,
