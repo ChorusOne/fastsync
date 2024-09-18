@@ -35,16 +35,21 @@ impl RateLimiter {
         self.last_update = now;
     }
 
-    pub fn time_until_bytes_available(&self, now: Instant, amount: u64) -> Duration {
+    pub fn time_until_bytes_available(&self, now: Instant, amount: u64) -> Option<Duration> {
+        if amount > self.capacity_bytes {
+            return None;
+        }
         let elapsed = now - self.last_update;
         let new_bytes = (elapsed.as_secs_f32() * self.bytes_per_second as f32) as u64;
         let total_bytes = self.available_bytes + new_bytes;
         if self.available_bytes + new_bytes > amount {
-            return Duration::from_secs(0);
+            return Some(Duration::from_secs(0));
         }
 
         let needed = amount - total_bytes;
-        Duration::from_secs_f32(needed as f32 / self.bytes_per_second as f32)
+        Some(Duration::from_secs_f32(
+            needed as f32 / self.bytes_per_second as f32,
+        ))
     }
 }
 
@@ -105,7 +110,7 @@ mod tests {
         rl.consume_bytes(now, 9_000_000);
         assert_eq!(rl.available_bytes, 1_000_000);
 
-        let wait_time = rl.time_until_bytes_available(now, 9_000_000);
+        let wait_time = rl.time_until_bytes_available(now, 9_000_000).unwrap();
         // at 10MB/s, 800ms for 800KB
         assert!(wait_time > Duration::from_millis(799) && wait_time < Duration::from_millis(801));
     }
@@ -119,13 +124,13 @@ mod tests {
         rl.consume_bytes(now, 9_000_000);
 
         assert_eq!(
-            rl.time_until_bytes_available(now, 1_000_000),
+            rl.time_until_bytes_available(now, 1_000_000).unwrap(),
             Duration::from_secs(0)
         );
     }
 
     #[test]
-    fn test_long_wait_time() {
+    fn test_wait_time_beyond_bucket_capacity() {
         let start = Instant::now();
         let mut rl = RateLimiter::new(10, 10_000_000, start);
 
@@ -135,6 +140,6 @@ mod tests {
         // this is not true, there will never be 20M available in the bucket.
         // not sure if this case should throw when asking for > bps
         let wait_time = rl.time_until_bytes_available(now, 20_000_000);
-        assert!(wait_time > Duration::from_secs(1) && wait_time < Duration::from_millis(2001));
+        assert!(wait_time.is_none());
     }
 }

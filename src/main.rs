@@ -384,7 +384,9 @@ fn main_send(
                     if let Some(ref mut ratelimiter) = opt_ratelimiter {
                         let to_wait =
                             ratelimiter.time_until_bytes_available(Instant::now(), MAX_CHUNK_LEN);
-                        std::thread::sleep(to_wait);
+                        // if to_wait is None, we've requested to send more than the bucket's max
+                        // capacity, which is a programming error. Crash the program.
+                        std::thread::sleep(to_wait.unwrap());
                     }
                     match file.send_one(start_time, &mut stream) {
                         Ok(SendResult::Progress {
