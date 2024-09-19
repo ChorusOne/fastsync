@@ -14,7 +14,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 use borsh::BorshDeserialize;
@@ -27,26 +27,29 @@ Usage:
   fastsync recv <server-addr> <num-streams>
 
 Sender options:
-  <listen-addr>    Address (IP and port) for the sending side to bind to and
-                   listen for receivers. This should be the address of a
-                   Wireguard interface if you care about confidentiality.
-                   E.g. '100.71.154.83:7999'.
+  <listen-addr>             Address (IP and port) for the sending side to bind to and
+                            listen for receivers. This should be the address of a
+                            Wireguard interface if you care about confidentiality.
+                            E.g. '100.71.154.83:7999'.
 
-  <in-files...>    Paths of files to send. Input file paths need to be relative.
-                   This is a safety measure to make it harder to accidentally
-                   overwrite files in /etc and the like on the receiving end.
+  [--max-bandwidth <MBps>]  Specify the maximum bandwidth to use over a 1 second sliding
+                            window, in MB/s. If unspecified, there will be no limit.
+
+  <in-files...>             Paths of files to send. Input file paths need to be relative.
+                            This is a safety measure to make it harder to accidentally
+                            overwrite files in /etc and the like on the receiving end.
 
 Receiver options:
-  <server-addr>    The address (IP and port) that the sender is listening on.
-                   E.g. '100.71.154.83:7999'.
+  <server-addr>             The address (IP and port) that the sender is listening on.
+                            E.g. '100.71.154.83:7999'.
 
-  <num-streams>    The number of TCP streams to open. For a value of 1, Fastsync
-                   behaves very similar to 'netcat'. With higher values,
-                   Fastsync leverages the fact that file chunks don't need to
-                   arrive in order to avoid the head-of-line blocking of a
-                   single connection. You should experiment to find the best
-                   value, going from 1 to 4 is usually helpful, going from 16
-                   to 32 is probably overkill.
+  <num-streams>             The number of TCP streams to open. For a value of 1, Fastsync
+                            behaves very similar to 'netcat'. With higher values,
+                            Fastsync leverages the fact that file chunks don't need to
+                            arrive in order to avoid the head-of-line blocking of a
+                            single connection. You should experiment to find the best
+                            value, going from 1 to 4 is usually helpful, going from 16
+                            to 32 is probably overkill.
 ";
 
 const WIRE_PROTO_VERSION: u16 = 1;
@@ -133,12 +136,25 @@ fn main() {
     match args.first().map(|s| &s[..]) {
         Some("send") if args.len() >= 3 => {
             let addr = &args[1];
-            let fnames = &args[2..];
+            let max_bandwidth = match args[2].as_str() {
+                "--max-bandwidth" => Some(
+                    args[3]
+                        .parse::<u32>()
+                        .expect("Invalid number for --max-bandwidth"),
+                ),
+                _ => None,
+            };
+            let fnames = if max_bandwidth.is_some() {
+                &args[4..]
+            } else {
+                &args[2..]
+            };
             main_send(
                 SocketAddr::from_str(addr).expect("Invalid send address"),
                 fnames,
                 WIRE_PROTO_VERSION,
                 events_tx,
+                max_bandwidth,
             )
             .expect("Failed to send.");
         }
@@ -275,6 +291,7 @@ fn main_send(
     fnames: &[String],
     protocol_version: u16,
     sender_events: std::sync::mpsc::Sender<SenderEvent>,
+    max_bandwidth_mbps: Option<u32>,
 ) -> Result<()> {
     let mut plan = TransferPlan {
         proto_version: protocol_version,
@@ -338,12 +355,34 @@ fn main_send(
 
         let state_clone = state_arc.clone();
         let push_thread = std::thread::spawn(move || {
+            let window_to_consider = Duration::from_millis(1000);
+            let mut last_offset = 0;
             let start_time = Instant::now();
             // All the threads iterate through all the files one by one, so all
             // the threads collaborate on sending the first one, then the second
             // one, etc.
+            let mut chunk_transfer_meta: Vec<(Instant, usize)> = Vec::new();
+
             'files: for file in state_clone.iter() {
                 'chunks: loop {
+                    if let Some(bw) = max_bandwidth_mbps {
+                        chunk_transfer_meta.retain(|&item| item.0.elapsed() < window_to_consider);
+                        let transferred_bytes = file.offset.load(Ordering::SeqCst) - last_offset;
+                        last_offset = file.offset.load(Ordering::SeqCst);
+                        chunk_transfer_meta.push((Instant::now(), transferred_bytes as usize));
+                        let bytes_transferred_last_second: usize =
+                            chunk_transfer_meta.iter().map(|x| x.1).sum();
+                        let mb_per_sec = bytes_transferred_last_second as f32 * 1e-6;
+
+                        let bw_has_likely_settled = start_time.elapsed().as_millis() > 500
+                            || chunk_transfer_meta.len() > 10;
+                        if mb_per_sec > bw as f32 && bw_has_likely_settled {
+                            let time_taken = chunk_transfer_meta[chunk_transfer_meta.len() - 1]
+                                .0
+                                .elapsed();
+                            std::thread::sleep(window_to_consider - time_taken);
+                        }
+                    }
                     match file.send_one(start_time, &mut stream) {
                         Ok(SendResult::Progress) => continue 'chunks,
                         Ok(SendResult::Done) => continue 'files,
@@ -601,6 +640,7 @@ mod tests {
                 &["a-file".into()],
                 1,
                 events_tx,
+                None,
             )
             .unwrap();
         });
@@ -627,6 +667,7 @@ mod tests {
                 &["a-file".into()],
                 2,
                 events_tx,
+                None,
             )
             .unwrap();
         });
