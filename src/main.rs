@@ -5,6 +5,8 @@
 // you may not use this file except in compliance with the License.
 // A copy of the License has been included in the root of the repository.
 
+mod ratelimiter;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read, Result, Write};
@@ -13,9 +15,11 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 use walkdir::WalkDir;
+
+use crate::ratelimiter::RateLimiter;
 
 use borsh::BorshDeserialize;
 use borsh::BorshSerialize;
@@ -27,26 +31,29 @@ Usage:
   fastsync recv <server-addr> <num-streams>
 
 Sender options:
-  <listen-addr>    Address (IP and port) for the sending side to bind to and
-                   listen for receivers. This should be the address of a
-                   Wireguard interface if you care about confidentiality.
-                   E.g. '100.71.154.83:7999'.
+  <listen-addr>                  Address (IP and port) for the sending side to bind to and
+                                 listen for receivers. This should be the address of a
+                                 Wireguard interface if you care about confidentiality.
+                                 E.g. '100.71.154.83:7999'.
 
-  <in-files...>    Paths of files to send. Input file paths need to be relative.
-                   This is a safety measure to make it harder to accidentally
-                   overwrite files in /etc and the like on the receiving end.
+  [--max-bandwidth-mbps <MBps>]  Specify the maximum bandwidth to use over a 1 second sliding
+                                 window, in MB/s. If unspecified, there will be no limit.
+
+  <in-files...>                  Paths of files to send. Input file paths need to be relative.
+                                 This is a safety measure to make it harder to accidentally
+                                 overwrite files in /etc and the like on the receiving end.
 
 Receiver options:
-  <server-addr>    The address (IP and port) that the sender is listening on.
-                   E.g. '100.71.154.83:7999'.
+  <server-addr>                  The address (IP and port) that the sender is listening on.
+                                 E.g. '100.71.154.83:7999'.
 
-  <num-streams>    The number of TCP streams to open. For a value of 1, Fastsync
-                   behaves very similar to 'netcat'. With higher values,
-                   Fastsync leverages the fact that file chunks don't need to
-                   arrive in order to avoid the head-of-line blocking of a
-                   single connection. You should experiment to find the best
-                   value, going from 1 to 4 is usually helpful, going from 16
-                   to 32 is probably overkill.
+  <num-streams>                  The number of TCP streams to open. For a value of 1, Fastsync
+                                 behaves very similar to 'netcat'. With higher values,
+                                 Fastsync leverages the fact that file chunks don't need to
+                                 arrive in order to avoid the head-of-line blocking of a
+                                 single connection. You should experiment to find the best
+                                 value, going from 1 to 4 is usually helpful, going from 16
+                                 to 32 is probably overkill.
 ";
 
 const WIRE_PROTO_VERSION: u16 = 1;
@@ -133,12 +140,25 @@ fn main() {
     match args.first().map(|s| &s[..]) {
         Some("send") if args.len() >= 3 => {
             let addr = &args[1];
-            let fnames = &args[2..];
+            let max_bandwidth = match args[2].as_str() {
+                "--max-bandwidth-mbps" => Some(
+                    args[3]
+                        .parse::<u64>()
+                        .expect("Invalid number for --max-bandwidth-mbps"),
+                ),
+                _ => None,
+            };
+            let fnames = if max_bandwidth.is_some() {
+                &args[4..]
+            } else {
+                &args[2..]
+            };
             main_send(
                 SocketAddr::from_str(addr).expect("Invalid send address"),
                 fnames,
                 WIRE_PROTO_VERSION,
                 events_tx,
+                max_bandwidth,
             )
             .expect("Failed to send.");
         }
@@ -179,7 +199,7 @@ struct SendState {
 
 enum SendResult {
     Done,
-    Progress,
+    Progress { bytes_sent: u64 },
 }
 
 /// Metadata about a chunk of data that follows.
@@ -234,6 +254,7 @@ impl SendState {
         let mut off = offset as i64;
         let out_fd = out.as_raw_fd();
         let in_fd = self.in_file.as_raw_fd();
+        let mut total_written: u64 = 0;
         while off < end {
             let count = (end - off) as usize;
             // Note, sendfile advances the offset by the number of bytes written
@@ -242,9 +263,12 @@ impl SendState {
             if n_written < 0 {
                 return Err(Error::last_os_error());
             }
+            total_written += n_written as u64;
         }
 
-        Ok(SendResult::Progress)
+        Ok(SendResult::Progress {
+            bytes_sent: total_written,
+        })
     }
 }
 
@@ -275,6 +299,7 @@ fn main_send(
     fnames: &[String],
     protocol_version: u16,
     sender_events: std::sync::mpsc::Sender<SenderEvent>,
+    max_bandwidth_mbps: Option<u64>,
 ) -> Result<()> {
     let mut plan = TransferPlan {
         proto_version: protocol_version,
@@ -314,6 +339,13 @@ fn main_send(
         ))
         .expect("Listener should not exit before the sender.");
 
+    let limiter_mutex = Arc::new(Mutex::new(Option::<RateLimiter>::None));
+
+    if let Some(mbps) = max_bandwidth_mbps {
+        let ratelimiter = RateLimiter::new(mbps, MAX_CHUNK_LEN, Instant::now());
+        _ = limiter_mutex.lock().unwrap().insert(ratelimiter);
+    }
+
     loop {
         let (mut stream, addr) = listener.accept()?;
         println!("Accepted connection from {addr}.");
@@ -337,15 +369,34 @@ fn main_send(
         }
 
         let state_clone = state_arc.clone();
+
+        let limiter_mutex_2 = limiter_mutex.clone();
         let push_thread = std::thread::spawn(move || {
             let start_time = Instant::now();
             // All the threads iterate through all the files one by one, so all
             // the threads collaborate on sending the first one, then the second
             // one, etc.
+
             'files: for file in state_clone.iter() {
                 'chunks: loop {
+                    let mut limiter_mutex = limiter_mutex_2.lock().unwrap();
+                    let mut opt_ratelimiter = limiter_mutex.as_mut();
+                    if let Some(ref mut ratelimiter) = opt_ratelimiter {
+                        let to_wait =
+                            ratelimiter.time_until_bytes_available(Instant::now(), MAX_CHUNK_LEN);
+                        // if to_wait is None, we've requested to send more than the bucket's max
+                        // capacity, which is a programming error. Crash the program.
+                        std::thread::sleep(to_wait.unwrap());
+                    }
                     match file.send_one(start_time, &mut stream) {
-                        Ok(SendResult::Progress) => continue 'chunks,
+                        Ok(SendResult::Progress {
+                            bytes_sent: bytes_written,
+                        }) => {
+                            if let Some(ref mut ratelimiter) = opt_ratelimiter {
+                                ratelimiter.consume_bytes(Instant::now(), bytes_written);
+                            }
+                            continue 'chunks;
+                        }
                         Ok(SendResult::Done) => continue 'files,
                         Err(err) => panic!("Failed to send: {err}"),
                     }
@@ -601,6 +652,7 @@ mod tests {
                 &["a-file".into()],
                 1,
                 events_tx,
+                None,
             )
             .unwrap();
         });
@@ -627,6 +679,7 @@ mod tests {
                 &["a-file".into()],
                 2,
                 events_tx,
+                None,
             )
             .unwrap();
         });
