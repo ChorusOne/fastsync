@@ -113,11 +113,11 @@ impl TransferPlan {
 
 /// The index of a file in the transfer plan.
 #[derive(BorshDeserialize, BorshSerialize, Copy, Clone, Debug, Eq, Hash, PartialEq)]
-struct FileId(u64);
+struct FileId(u32);
 
 impl FileId {
     fn from_usize(i: usize) -> FileId {
-        assert!(i < u64::MAX as usize, "Can transfer at most 2^64 files.");
+        assert!(i < u32::MAX as usize, "Can transfer at most 2^32 files.");
         FileId(i as _)
     }
 }
@@ -205,7 +205,7 @@ enum SendResult {
 
 /// Metadata about a chunk of data that follows.
 ///
-/// The Borsh-generated representation of this is zero-overhead (20 bytes).
+/// The Borsh-generated representation of this is zero-overhead (16 bytes).
 #[derive(BorshDeserialize, BorshSerialize, Debug)]
 struct ChunkHeader {
     /// Which file is the chunk from?
@@ -219,8 +219,8 @@ struct ChunkHeader {
 }
 
 impl ChunkHeader {
-    fn to_bytes(&self) -> [u8; 20] {
-        let mut buffer = [0_u8; 20];
+    fn to_bytes(&self) -> [u8; 16] {
+        let mut buffer = [0_u8; 16];
         let mut cursor = std::io::Cursor::new(&mut buffer[..]);
         self.serialize(&mut cursor)
             .expect("Writing to memory never fails.");
@@ -503,7 +503,6 @@ impl FileReceiver {
             self.offset += chunk.data.len() as u64;
         }
 
-        //self.out_file = Some(out_file);
         Ok(())
     }
 }
@@ -586,7 +585,7 @@ fn main_recv(
                 // Read a chunk header. If we hit EOF, that is not an error, it
                 // means that the sender has nothing more to send so we can just
                 // exit here.
-                let mut buf = [0u8; 20];
+                let mut buf = [0u8; 16];
                 match stream.read_exact(&mut buf) {
                     Ok(..) => {}
                     Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
