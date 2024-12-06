@@ -19,6 +19,7 @@ impl RateLimiter {
         }
     }
 
+    #[cfg(test)]
     pub fn bytes_available(&self, now: Instant) -> u64 {
         let elapsed = now - self.last_update;
         let new_bytes = elapsed.as_secs_f32() * self.bytes_per_second as f32;
