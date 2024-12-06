@@ -10,6 +10,12 @@ Changes with compatibility impact will be marked as such in the changelog.
 There is no compatibility guarantee of the wire protocol between different
 versions, even if they differ only in `PATCH`.
 
+## 1.1.0
+
+Released 2024-12-06.
+
+ * Add support for send-side throttling with `--max-bandwidth-mbps`.
+
 ## 1.0.0
 
 Released 2024-09-09.
