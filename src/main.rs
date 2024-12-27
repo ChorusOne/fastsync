@@ -259,7 +259,20 @@ impl SendState {
             let count = (end - off) as usize;
             // Note, sendfile advances the offset by the number of bytes written
             // so we should not increment `off` ourselves.
-            let n_written = unsafe { libc::sendfile64(out_fd, in_fd, &mut off, count) };
+
+            let n_written = unsafe {
+                #[cfg(target_os = "linux")]
+                {
+                    libc::sendfile64(out_fd, in_fd, &mut off, count)
+                }
+
+                #[cfg(target_os = "macos")]
+                {
+                    let mut len = count as libc::off_t;
+                    libc::sendfile(out_fd, in_fd, off, &mut len, std::ptr::null_mut(), 0)
+                }
+            };
+
             if n_written < 0 {
                 return Err(Error::last_os_error());
             }
