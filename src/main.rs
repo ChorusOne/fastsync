@@ -527,6 +527,11 @@ impl FileReceiver {
             self.offset += chunk.data.len() as u64;
         }
 
+        if self.offset < self.total_len {
+            self.out_file = Some(out_file);
+            // Only keep the file open as long as there is more to write
+        }
+
         Ok(())
     }
 }
