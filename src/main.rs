@@ -274,6 +274,9 @@ impl SendState {
             *state = SendStateInner::Done;
             return Ok(SendResult::Done);
         }
+        // Drop the lock while sending -- so that multiple threads can
+        // send data from the same file at once
+        std::mem::drop(state);
 
         print_progress(offset, self.len, start_time);
 
