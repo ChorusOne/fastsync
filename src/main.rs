@@ -261,10 +261,10 @@ impl SendState {
             }
             SendStateInner::InProgress {
                 ref file,
-                mut offset,
+                ref mut offset,
             } => {
-                offset += MAX_CHUNK_LEN;
-                (offset, file.as_raw_fd())
+                *offset += MAX_CHUNK_LEN;
+                (*offset, file.as_raw_fd())
             }
         };
 
@@ -766,6 +766,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_sends_large_file() {
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
+        env::set_current_dir("/tmp/").unwrap();
+        let cwd = env::current_dir().unwrap();
+        thread::spawn(|| {
+            let td = TempDir::new_in(".").unwrap();
+            let tmp_path = td.path().strip_prefix(cwd).unwrap();
+            let path = tmp_path.join("large");
+            let fnames = &[path.clone().into_os_string().into_string().unwrap()];
+
+            {
+                let mut f = std::fs::File::create(path).unwrap();
+                f.write_all(&vec![0u8; MAX_CHUNK_LEN as usize * 100])
+                    .unwrap();
+            }
+
+            main_send(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+                fnames,
+                1,
+                events_tx,
+                None,
+            )
+            .unwrap();
+        });
+        match events_rx.recv().unwrap() {
+            SenderEvent::Listening(port) => {
+                main_recv(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
+                    "1",
+                    WriteMode::Force,
+                    1,
+                )
+                .unwrap();
+            }
+        }
+    }
     #[test]
     fn test_sends_20_thousand_files() {
         let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
