@@ -242,13 +242,13 @@ impl SendState {
         let mut state = self.state.lock();
         let (offset, in_fd) = match *state {
             SendStateInner::Pending { ref fname } => {
-                let res = std::fs::File::open(fname);
-                if let Err(ref e) = res {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        return Ok(SendResult::FileVanished);
+                let res = match std::fs::File::open(fname) {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(SendResult::FileVanished)
                     }
-                }
-                let res = res?;
+                    Err(e) => return Err(e),
+                };
                 let fd = res.as_raw_fd();
                 *state = SendStateInner::InProgress {
                     file: res,
