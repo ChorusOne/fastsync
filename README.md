@@ -1,10 +1,10 @@
 # Fastsync
 
-Fastsync transfers files between machines as fast as the network allows. Tools
-that transfer files over a single TCP connection — what `rsync`, `scp`, and
-even raw `netcat` do — often fail to saturate the network link. This is due to
-[head-of-line blocking][tcp-hol]. Opening multiple TCP connections can bring
-a significant boost in transfer speed.
+Fastsync transfers files and/or directories between machines as fast as the
+network allows. Tools that transfer files over a single TCP connection — what
+`rsync`, `scp`, and even raw `netcat` do — often fail to saturate the network
+link. This is due to [head-of-line blocking][tcp-hol]. Opening multiple TCP
+connections can bring a significant boost in transfer speed.
 
 Fastsync targets the following use case:
 
@@ -38,8 +38,15 @@ like 7999 (assuming it's not bound to). Then on the sending end:
 
     fastsync send 100.71.154.83:7999 file.tar.gz
 
+Alternatively if you want to send an entire directory, then you should something
+like the command below. Please note that fastsync will not allow absolute paths:
+
+    cd /some/path/
+    fastsync send 100.71.154.83:7999 ./data
+
 On the receiving end, suppose we download with 32 TCP connections:
 
+    cd /some/path
     fastsync recv 100.71.154.83:7999 32
 
 ## Known issues
