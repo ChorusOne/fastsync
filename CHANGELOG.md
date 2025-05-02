@@ -10,6 +10,13 @@ Changes with compatibility impact will be marked as such in the changelog.
 There is no compatibility guarantee of the wire protocol between different
 versions, even if they differ only in `PATCH`.
 
+## 1.1.1
+
+Released 2025-05-02.
+
+ * Remove max file limit on transfer
+ * Minor efficiency optimizations
+
 ## 1.1.0
 
 Released 2024-12-06.
