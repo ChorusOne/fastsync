@@ -34,20 +34,20 @@ Build a static binary that is more likely to be portable:
 ## How to use
 
 Suppose the sender has Tailscale IP 100.71.154.83. Pick some available port,
-like 7999 (assuming it's not bound to). Then on the sending end:
+like 4440 (assuming it's not bound to). Then on the sending end:
 
-    fastsync send 100.71.154.83:7999 file.tar.gz
+    fastsync send 100.71.154.83:4440 file.tar.gz
 
 Alternatively if you want to send an entire directory, then you should something
 like the command below. Please note that fastsync will not allow absolute paths:
 
     cd /some/path/
-    fastsync send 100.71.154.83:7999 ./data
+    fastsync send 100.71.154.83:4440 ./data
 
 On the receiving end, suppose we download with 32 TCP connections:
 
     cd /some/path
-    fastsync recv 100.71.154.83:7999 32
+    fastsync recv 100.71.154.83:4440 32
 
 ## Known issues
 
