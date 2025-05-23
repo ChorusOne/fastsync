@@ -15,9 +15,6 @@ Fastsync targets the following use case:
  * **Compression is handled externally.** Fastsync does not compress the stream.
    If the data volume benefits from compression, then compress the files ahead
    of time with e.g. `lz4`, `brotli`, or `zstd`.
- * **A full transfer is necessary.** Fastsync always sends all files. If some
-   files are already present at the receiving side, or similar data is already
-   present, `rsync` might be a better fit.
 
 ## Building
 
@@ -48,6 +45,38 @@ On the receiving end, suppose we download with 32 TCP connections:
 
     cd /some/path
     fastsync recv 100.71.154.83:4440 32
+
+File modification timestamps are preserved during all transfers.
+
+## Incremental transfers
+
+Fastsync supports incremental transfers with the `--incremental` flag. When enabled, fastsync will:
+
+1. Compare files by name, size, and modification timestamp
+2. Skip files that already exist at the destination with matching size and timestamp
+3. Transfer only files that are missing or have different size/timestamp
+
+Both sender and receiver must use the `--incremental` flag:
+
+    # Sender
+    fastsync send 100.71.154.83:4440 --incremental file.tar.gz
+
+    # Receiver
+    fastsync recv 100.71.154.83:4440 32 --incremental
+
+## Testing
+
+To run all tests:
+
+    cargo test
+
+To run only unit tests:
+
+    cargo test --lib
+
+To run integration tests:
+
+    cd tests && ./integration_tests.sh
 
 ## Known issues
 
