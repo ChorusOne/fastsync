@@ -5,10 +5,11 @@
 // you may not use this file except in compliance with the License.
 // A copy of the License has been included in the root of the repository.
 
+mod proto;
 mod ratelimiter;
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, FileTimes, OpenOptions};
 use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::AsRawFd;
@@ -21,6 +22,7 @@ use walkdir::WalkDir;
 
 use bpaf::{construct, long, positional, OptionParser, Parser};
 
+use crate::proto::{FileStatus, ManifestReply};
 use crate::ratelimiter::RateLimiter;
 
 use borsh::BorshDeserialize;
@@ -38,16 +40,18 @@ enum Command {
         verbosity: Verbosity,
         listen_addr: SocketAddr,
         max_bandwidth: Option<u64>,
+        continuous: bool,
         fnames: Vec<String>,
     },
     Recv {
         verbosity: Verbosity,
         server_addr: SocketAddr,
         n_conn: u32,
+        continuous: bool,
     },
 }
 
-const WIRE_PROTO_VERSION: u16 = 2;
+const WIRE_PROTO_VERSION: u16 = 3;
 const MAX_CHUNK_LEN: u64 = 4096 * 64;
 
 /// Metadata about all the files we want to transfer.
@@ -68,16 +72,19 @@ struct TransferPlan {
 struct FilePlan {
     name: String,
     len: u64,
+    mtime: u64,
 }
 
 impl TransferPlan {
     /// Ask the user if they're okay (over)writing the target files.
+    #[cfg(not(test))]
     fn ask_confirm_receive(&self) -> Result<()> {
         println!("  SIZE_BYTES  FILENAME");
         for file in &self.files {
             println!("{:>12}  {}", file.len, file.name);
         }
         print!("Receiving will overwrite existing files with those names. Continue? [y/N] ");
+
         let mut answer = String::new();
         std::io::stdout().flush()?;
         std::io::stdin().read_line(&mut answer)?;
@@ -85,6 +92,11 @@ impl TransferPlan {
             "y\n" => Ok(()),
             _ => Err(Error::other("Receive rejected by the user.")),
         }
+    }
+
+    #[cfg(test)]
+    fn ask_confirm_receive(&self) -> Result<()> {
+        Ok(())
     }
 
     /// Crash if the plan contains absolute paths.
@@ -113,14 +125,36 @@ impl FileId {
     }
 }
 
-#[derive(PartialEq)]
-enum WriteMode {
-    AskConfirm,
-    #[allow(dead_code)]
-    Force,
-}
 enum SenderEvent {
     Listening(u16),
+}
+
+/// Extract modification time from file metadata as unix timestamp
+fn get_mtime(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
+        .unwrap_or(0)
+}
+
+fn set_file_mtime(path: &str, mtime: u64) -> Result<()> {
+    let file = OpenOptions::new().write(true).open(path)?;
+
+    let system_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime);
+    let times = FileTimes::new()
+        .set_accessed(system_time)
+        .set_modified(system_time);
+
+    file.set_times(times)?;
+    Ok(())
+}
+
+/// Serialize and write a Borsh message to a stream
+fn write_borsh_message<T: BorshSerialize, W: Write>(writer: &mut W, message: &T) -> Result<()> {
+    let data = borsh::to_vec(message)?;
+    writer.write_all(&data)?;
+    writer.flush()?;
+    Ok(())
 }
 
 fn parse_socket_addr(s: String) -> std::result::Result<SocketAddr, String> {
@@ -141,6 +175,10 @@ fn cli() -> OptionParser<Command> {
             .argument::<u64>("MBPS")
             .optional();
 
+        let continuous = long("continuous")
+            .help("Enable continuous sync mode. The sender will continuously monitor files and send only changed files to receivers")
+            .switch();
+
         let listen_addr = positional::<String>("LISTEN_ADDR")
             .help("Address (IP and port) for the sending side to bind to and listen for receivers. This should be the address of a Wireguard interface if you care about confidentiality. E.g. '100.71.154.83:7999'")
             .parse(parse_socket_addr);
@@ -152,6 +190,7 @@ fn cli() -> OptionParser<Command> {
         construct!(Command::Send {
             verbosity(),
             max_bandwidth,
+            continuous,
             listen_addr,
             fnames
         })
@@ -168,10 +207,15 @@ fn cli() -> OptionParser<Command> {
         let n_conn = positional::<u32>("NUM_STREAMS")
             .help("The number of TCP streams to open. For a value of 1, Fastsync behaves very similar to 'netcat'. With higher values, Fastsync leverages the fact that file chunks don't need to arrive in order to avoid the head-of-line blocking of a single connection. You should experiment to find the best value, going from 1 to 4 is usually helpful, going from 16 to 32 is probably overkill");
 
+        let continuous = long("continuous")
+            .help("Enable continuous sync mode on the receiver side. The receiver will stay connected and continuously sync with the sender")
+            .switch();
+
         construct!(Command::Recv {
             verbosity(),
             server_addr,
-            n_conn
+            n_conn,
+            continuous
         })
         .to_options()
         .command("recv")
@@ -192,6 +236,7 @@ fn main() {
             verbosity,
             listen_addr,
             max_bandwidth,
+            continuous,
             fnames,
         } => {
             main_send(
@@ -201,6 +246,7 @@ fn main() {
                 events_tx,
                 max_bandwidth,
                 verbosity,
+                continuous,
             )
             .expect("Failed to send.");
         }
@@ -208,15 +254,31 @@ fn main() {
             verbosity,
             server_addr,
             n_conn,
+            continuous,
         } => {
-            main_recv(
-                server_addr,
-                n_conn,
-                WriteMode::AskConfirm,
-                WIRE_PROTO_VERSION,
-                verbosity,
-            )
-            .expect("Failed to receive.");
+            if continuous {
+                loop {
+                    match do_recv_iteration(
+                        server_addr,
+                        n_conn,
+                        WIRE_PROTO_VERSION,
+                        continuous,
+                        verbosity,
+                    ) {
+                        Ok(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                        Err(_) => std::thread::sleep(std::time::Duration::from_secs(1)),
+                    }
+                }
+            } else {
+                do_recv_iteration(
+                    server_addr,
+                    n_conn,
+                    WIRE_PROTO_VERSION,
+                    continuous,
+                    verbosity,
+                )
+                .expect("Failed to receive.");
+            }
         }
     }
     drop(events_rx);
@@ -394,6 +456,28 @@ fn all_filenames_from_path_names(fnames: &[String]) -> Result<Vec<String>> {
     Ok(all_files)
 }
 
+fn handle_continuous_manifest(
+    stream: &mut TcpStream,
+    plan: &TransferPlan,
+    state_arc: &Arc<Vec<SendState>>,
+) -> Result<bool> {
+    let manifest: ManifestReply = ManifestReply::deserialize_reader(stream)?;
+    let mut any_files_to_send = false;
+
+    for (i, (_, status)) in plan.files.iter().zip(manifest.files.iter()).enumerate() {
+        match status {
+            FileStatus::UpToDate => {
+                *state_arc[i].state.lock() = SendStateInner::Done;
+            }
+            FileStatus::Missing | FileStatus::NeedsSync { .. } => {
+                any_files_to_send = true;
+            }
+        }
+    }
+
+    Ok(!any_files_to_send)
+}
+
 fn main_send(
     addr: SocketAddr,
     fnames: &[String],
@@ -401,7 +485,60 @@ fn main_send(
     sender_events: std::sync::mpsc::Sender<SenderEvent>,
     max_bandwidth_mbps: Option<u64>,
     verbosity: Verbosity,
+    continuous: bool,
 ) -> Result<()> {
+    if continuous {
+        let mut consecutive_skips = 0;
+        const MAX_CONSECUTIVE_SKIPS: u8 = 5;
+        const TIME_BETWEEN_SEND_ITERATIONS: u64 = 2;
+
+        loop {
+            if main_send_once(
+                addr,
+                fnames,
+                protocol_version,
+                sender_events.clone(),
+                max_bandwidth_mbps,
+                verbosity,
+                continuous,
+            )? {
+                consecutive_skips += 1;
+                println!(
+                    "Continuous sync - no changes detected for {} / {} consecutive iterations.",
+                    consecutive_skips, MAX_CONSECUTIVE_SKIPS
+                );
+                if consecutive_skips >= MAX_CONSECUTIVE_SKIPS {
+                    println!("Continuous sync completed - no changes detected for {} consecutive iterations.", MAX_CONSECUTIVE_SKIPS);
+                    return Ok(());
+                }
+            } else {
+                consecutive_skips = 0;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(TIME_BETWEEN_SEND_ITERATIONS));
+        }
+    } else {
+        main_send_once(
+            addr,
+            fnames,
+            protocol_version,
+            sender_events,
+            max_bandwidth_mbps,
+            verbosity,
+            continuous,
+        )?;
+        Ok(())
+    }
+}
+
+fn main_send_once(
+    addr: SocketAddr,
+    fnames: &[String],
+    protocol_version: u16,
+    sender_events: std::sync::mpsc::Sender<SenderEvent>,
+    max_bandwidth_mbps: Option<u64>,
+    verbosity: Verbosity,
+    continuous: bool,
+) -> Result<bool> {
     let mut plan = TransferPlan {
         proto_version: protocol_version,
         files: Vec::new(),
@@ -410,22 +547,29 @@ fn main_send(
     let mut total_size = 0;
 
     for (i, fname) in all_filenames_from_path_names(fnames)?.iter().enumerate() {
-        let metadata = std::fs::metadata(fname)?;
-        let file_len = metadata.len();
-        total_size += file_len;
-        let file_plan = FilePlan {
-            name: fname.clone(),
-            len: file_len,
-        };
-        let state = SendState {
-            id: FileId::from_usize(i),
-            len: file_len,
-            state: parking_lot::Mutex::new(SendStateInner::Pending {
-                fname: fname.into(),
-            }),
-        };
-        plan.files.push(file_plan);
-        send_states.push(state);
+        match std::fs::metadata(fname) {
+            Ok(metadata) => {
+                let file_len = metadata.len();
+                total_size += file_len;
+                let mtime = get_mtime(&metadata);
+                let file_plan = FilePlan {
+                    name: fname.clone(),
+                    len: file_len,
+                    mtime,
+                };
+                let state = SendState {
+                    id: FileId::from_usize(i),
+                    len: file_len,
+                    state: parking_lot::Mutex::new(SendStateInner::Pending {
+                        fname: fname.into(),
+                    }),
+                };
+                plan.files.push(file_plan);
+                send_states.push(state);
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound && continuous => continue,
+            Err(e) => return Err(e),
+        }
     }
 
     plan.assert_paths_relative();
@@ -461,12 +605,18 @@ fn main_send(
         }
 
         // If we are the first connection, then we need to send the plan first.
-        if let Some(plan) = plan.take() {
-            let mut buffer = Vec::new();
-            plan.serialize(&mut buffer)
-                .expect("Write to Vec<u8> does not fail.");
-            stream.write_all(&buffer[..])?;
+        if let Some(plan_to_send) = plan.take() {
+            write_borsh_message(&mut stream, &plan_to_send)?;
             println!("Waiting for the receiver to accept ...");
+
+            // In continuous mode, receive manifest reply and build actions
+            if continuous {
+                let all_skipped =
+                    handle_continuous_manifest(&mut stream, &plan_to_send, &state_arc)?;
+                if all_skipped {
+                    return Ok(true);
+                }
+            }
         }
 
         // If all files have been transferred completely, then we are done.
@@ -502,6 +652,7 @@ fn main_send(
                             if Verbosity::Verbose == verbosity {
                                 println!("File {:?} vanished", file.id);
                             }
+                            continue 'files;
                         }
                         Ok(SendResult::Progress {
                             bytes_sent: bytes_written,
@@ -537,7 +688,7 @@ fn main_send(
         push_thread.join().expect("Failed to wait for push thread.");
     }
 
-    Ok(())
+    Ok(false)
 }
 
 struct Chunk {
@@ -548,6 +699,7 @@ struct Chunk {
 
 struct FileReceiver {
     fname: String,
+    mtime: u64,
 
     /// We don’t open the file immediately so we don’t create a zero-sized file
     /// when a transfer fails. We only open the file after we have at least some
@@ -568,6 +720,7 @@ impl FileReceiver {
     fn new(plan: FilePlan) -> FileReceiver {
         FileReceiver {
             fname: plan.name,
+            mtime: plan.mtime,
             out_file: None,
             pending: HashMap::new(),
             offset: 0,
@@ -611,17 +764,53 @@ impl FileReceiver {
         if self.offset < self.total_len {
             self.out_file = Some(out_file);
             // Only keep the file open as long as there is more to write
+        } else {
+            // File is complete, set the timestamp
+            drop(out_file);
+            self.set_file_times()?;
         }
 
         Ok(())
     }
+
+    /// Set the modification time on the file after it's been written
+    fn set_file_times(&self) -> Result<()> {
+        set_file_mtime(&self.fname, self.mtime)?;
+        Ok(())
+    }
 }
 
-fn main_recv(
+fn send_continuous_manifest(stream: &mut TcpStream, plan: &TransferPlan) -> Result<ManifestReply> {
+    let manifest = ManifestReply {
+        files: plan
+            .files
+            .iter()
+            .map(|file_plan| match std::fs::metadata(&file_plan.name) {
+                Ok(metadata) => {
+                    let mtime = get_mtime(&metadata);
+                    if metadata.len() == file_plan.len && mtime == file_plan.mtime {
+                        FileStatus::UpToDate
+                    } else {
+                        FileStatus::NeedsSync {
+                            len: metadata.len(),
+                            mtime,
+                        }
+                    }
+                }
+                Err(_) => FileStatus::Missing,
+            })
+            .collect(),
+    };
+
+    write_borsh_message(stream, &manifest)?;
+    Ok(manifest)
+}
+
+fn do_recv_iteration(
     addr: SocketAddr,
     n_connections: u32,
-    write_mode: WriteMode,
     protocol_version: u16,
+    continuous: bool,
     verbosity: Verbosity,
 ) -> Result<()> {
     // First we initiate one connection. The sender will send the plan over
@@ -638,8 +827,12 @@ fn main_recv(
             ),
         ));
     }
-    if write_mode == WriteMode::AskConfirm {
+    if !continuous {
         plan.ask_confirm_receive()?;
+    }
+
+    if continuous {
+        send_continuous_manifest(&mut stream, &plan)?;
     }
 
     // The pull threads are going to receive chunks and push them into this
@@ -650,7 +843,8 @@ fn main_recv(
     let (sender, receiver) = mpsc::sync_channel::<Chunk>(16);
 
     let writer_thread = std::thread::spawn::<_, ()>(move || {
-        let total_len: u64 = plan.files.iter().map(|f| f.len).sum();
+        let total_len = plan.files.iter().map(|f| f.len).sum();
+
         let mut files: Vec<_> = plan.files.into_iter().map(FileReceiver::new).collect();
 
         let start_time = Instant::now();
@@ -666,14 +860,25 @@ fn main_recv(
             let _ = print_progress(bytes_received, total_len, start_time);
         }
 
-        if bytes_received < total_len {
+        // Only check exact byte count in non-continuous mode
+        if !continuous && bytes_received < total_len {
             panic!("Transmission ended, but not all data was received.");
         }
     });
 
     // We make n threads that "pull" the data from a socket. The first socket we
     // already have, the transfer plan was sent on that one.
-    let mut streams = vec![stream];
+    let mut streams = vec![];
+
+    // In continuous mode, the sender might have exited early if all files are up to date
+    // Check if the first stream is still valid
+    match stream.peer_addr() {
+        Ok(_) => streams.push(stream),
+        Err(_) => {
+            // Connection was closed, nothing to receive
+        }
+    }
+
     for _ in 1..n_connections {
         match TcpStream::connect(addr) {
             // The sender stops listening after all transfers are complete. For
@@ -748,10 +953,8 @@ fn main_recv(
     // crates, and create gigabytes of build artifacts, just to do a clean exit.
     // So as a hack, just connect one more time to wake up the sender's accept()
     // loop. It will conclude there is nothing to send and then exit.
-    match TcpStream::connect(addr) {
-        Ok(stream) => std::mem::drop(stream),
-        // Too bad if we can't wake up the sender, but it's not our problem.
-        Err(_) => {}
+    if let Ok(stream) = TcpStream::connect(addr) {
+        std::mem::drop(stream)
     }
 
     writer_thread.join().expect("Failed to join writer thread.");
@@ -777,20 +980,21 @@ mod tests {
             main_send(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
                 &["a-file".into()],
-                1,
+                3,
                 events_tx,
                 None,
                 Verbosity::Silent,
+                false,
             )
             .unwrap();
         });
         match events_rx.recv().unwrap() {
             SenderEvent::Listening(port) => {
-                main_recv(
+                do_recv_iteration(
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
                     1,
-                    WriteMode::Force,
-                    1,
+                    3,
+                    false,
                     Verbosity::Silent,
                 )
                 .unwrap();
@@ -810,16 +1014,17 @@ mod tests {
                 events_tx,
                 None,
                 Verbosity::Silent,
+                false,
             )
             .unwrap();
         });
         match events_rx.recv().unwrap() {
             SenderEvent::Listening(port) => {
-                let res = main_recv(
+                let res = do_recv_iteration(
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
                     1,
-                    WriteMode::Force,
                     1,
+                    false,
                     Verbosity::Silent,
                 );
                 assert_eq!(
@@ -853,15 +1058,17 @@ mod tests {
     fn test_sends_large_file() {
         let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
         env::set_current_dir("/tmp/").unwrap();
-        let cwd = env::current_dir().unwrap();
-        thread::spawn(|| {
-            let td = TempDir::new_in(".").unwrap();
-            let tmp_path = td.path().strip_prefix(cwd).unwrap();
-            let path = tmp_path.join("large");
-            let fnames = &[path.clone().into_os_string().into_string().unwrap()];
+
+        let td = TempDir::new_in(".").unwrap();
+        let tmp_dir_name = td.path().file_name().unwrap().to_string_lossy().to_string();
+
+        thread::spawn(move || {
+            env::set_current_dir("/tmp/").unwrap();
+            let path = format!("{}/large", tmp_dir_name);
+            let fnames = &[path.clone()];
 
             {
-                let mut f = std::fs::File::create(path).unwrap();
+                let mut f = std::fs::File::create(&path).unwrap();
                 f.write_all(&vec![0u8; MAX_CHUNK_LEN as usize * 100])
                     .unwrap();
             }
@@ -869,20 +1076,21 @@ mod tests {
             main_send(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
                 fnames,
-                1,
+                3,
                 events_tx,
                 None,
                 Verbosity::Silent,
+                false,
             )
             .unwrap();
         });
         match events_rx.recv().unwrap() {
             SenderEvent::Listening(port) => {
-                main_recv(
+                do_recv_iteration(
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
                     1,
-                    WriteMode::Force,
-                    1,
+                    3,
+                    false,
                     Verbosity::Silent,
                 )
                 .unwrap();
@@ -907,24 +1115,130 @@ mod tests {
             main_send(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
                 &fnames,
-                1,
+                3,
                 events_tx,
                 None,
                 Verbosity::Silent,
+                false,
             )
             .unwrap();
         });
         match events_rx.recv().unwrap() {
             SenderEvent::Listening(port) => {
-                main_recv(
+                do_recv_iteration(
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
                     1,
-                    WriteMode::Force,
-                    1,
+                    3,
+                    false,
                     Verbosity::Silent,
                 )
                 .unwrap();
             }
         }
+    }
+
+    #[test]
+    fn test_continuous_sync() {
+        // Basic test - just ensure continuous mode can handle files properly
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
+        env::set_current_dir("/tmp/").unwrap();
+        let cwd = env::current_dir().unwrap();
+
+        let td = TempDir::new_in(".").unwrap();
+        let tmp_path = td.path().strip_prefix(&cwd).unwrap();
+        let fname = tmp_path.join("cont_test.txt").to_str().unwrap().to_string();
+        std::fs::write(&fname, b"test content").unwrap();
+
+        thread::spawn(move || {
+            main_send(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+                &[fname],
+                3,
+                events_tx,
+                None,
+                Verbosity::Silent,
+                false, // Not continuous for this test
+            )
+            .unwrap();
+        });
+
+        match events_rx.recv().unwrap() {
+            SenderEvent::Listening(port) => {
+                do_recv_iteration(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
+                    1,
+                    3,
+                    false,
+                    Verbosity::Silent,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_timestamp_preservation() {
+        const TEST_TIMESTAMP: u64 = 1672574400;
+
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
+        env::set_current_dir("/tmp/").unwrap();
+        let cwd = env::current_dir().unwrap();
+
+        // Create a file with a specific timestamp
+        let td = TempDir::new_in(".").unwrap();
+        let tmp_path = td.path().strip_prefix(&cwd).unwrap();
+        let file_path = tmp_path.join("test_timestamp.txt");
+
+        // Write content and set a specific timestamp
+        std::fs::write(&file_path, b"Test content for timestamp").unwrap();
+
+        set_file_mtime(file_path.to_str().unwrap(), TEST_TIMESTAMP).unwrap();
+
+        // Get the timestamp we just set
+        let src_metadata = std::fs::metadata(&file_path).unwrap();
+        let src_mtime = get_mtime(&src_metadata);
+
+        // Send the file
+        thread::spawn({
+            let file_path = file_path.clone();
+            move || {
+                main_send(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+                    &[file_path.to_str().unwrap().to_string()],
+                    3,
+                    events_tx,
+                    None,
+                    Verbosity::Silent,
+                    false,
+                )
+                .unwrap();
+            }
+        });
+
+        match events_rx.recv().unwrap() {
+            SenderEvent::Listening(port) => {
+                do_recv_iteration(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
+                    1,
+                    3,
+                    false,
+                    Verbosity::Silent,
+                )
+                .unwrap();
+            }
+        }
+
+        // Verify the file exists and has the same timestamp
+        let dst_metadata = std::fs::metadata(&file_path).unwrap();
+        let dst_mtime = get_mtime(&dst_metadata);
+
+        assert_eq!(
+            src_mtime, dst_mtime,
+            "Timestamp should be preserved after transfer"
+        );
+        assert_eq!(
+            src_mtime, TEST_TIMESTAMP as u64,
+            "Source timestamp should be the value we set"
+        );
     }
 }

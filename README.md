@@ -15,9 +15,6 @@ Fastsync targets the following use case:
  * **Compression is handled externally.** Fastsync does not compress the stream.
    If the data volume benefits from compression, then compress the files ahead
    of time with e.g. `lz4`, `brotli`, or `zstd`.
- * **A full transfer is necessary.** Fastsync always sends all files. If some
-   files are already present at the receiving side, or similar data is already
-   present, `rsync` might be a better fit.
 
 ## Building
 
@@ -49,6 +46,48 @@ On the receiving end, suppose we download with 32 TCP connections:
     cd /some/path
     fastsync recv 100.71.154.83:4440 32
 
+File modification timestamps are preserved during all transfers.
+
+## Continuous mode
+
+Fastsync supports continuous mode with the `--continuous` flag. When enabled, fastsync will:
+
+1. Compare files by name, size, and modification timestamp
+2. Skip files that already exist at the destination with matching size and timestamp
+3. Transfer only files that are missing or have different size/timestamp
+4. Keep syncing in rounds with a 2-second delay between rounds
+5. After each transfer round, wait and then re-scan the source files
+6. If changes are detected in the new scan, start another sync round
+7. Stop when 5 consecutive rounds finish with no changes detected
+
+Both sender and receiver must use the `--continuous` flag:
+
+    # Receiver
+    fastsync recv <ip>:<port> 32 --continuous
+
+    # Sender
+    fastsync send <ip>:<port> --continuous ./data
+
+**Note:** Continuous mode only handles file additions and modifications. File deletions from the sender are not propagated to the receiver - files that exist at the destination will remain even if they're removed from the source.
+
+## Testing
+
+To run all tests:
+
+    cargo test
+
+To run only unit tests:
+
+    cargo test --lib
+
+To run integration tests:
+
+    ./integration_tests/test_continuous.sh
+
+## Known issues
+
+ * It's too spammy.
+ * Transfer time estimation can be improved.
 ## License
 
 Fastsync is licensed under the [Apache 2.0 License][apache2]. A copy of the
