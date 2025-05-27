@@ -41,26 +41,26 @@ echo "File 4 new content" > /tmp/fastsync_test_src/file4.txt
 # Ensure the modified file has a different timestamp than the original
 touch /tmp/fastsync_test_src/file2.txt
 
-# Incremental sync
-echo "=== Incremental sync ==="
+# Continuous mode
+echo "=== Continuous mode ==="
 cd /tmp/fastsync_test_src
-"$FASTSYNC_BIN" send 127.0.0.1:8899 --incremental *.txt 2>&1 | tee /tmp/fastsync_test_output.txt &
+"$FASTSYNC_BIN" send 127.0.0.1:8899 --continuous *.txt 2>&1 | tee /tmp/fastsync_test_output.txt &
 SENDER_PID=$!
 sleep 1
 
 cd /tmp/fastsync_test_dst
-echo "y" | "$FASTSYNC_BIN" recv 127.0.0.1:8899 2 --incremental >/dev/null
+echo "y" | "$FASTSYNC_BIN" recv 127.0.0.1:8899 2 --continuous >/dev/null
 wait $SENDER_PID
 
 # Verify that the right files were skipped/transferred
-echo "=== Verifying incremental behavior ==="
+echo "=== Verifying continuous mode behavior ==="
 if grep -q "\[SKIP\] file1.txt.*already up to date" /tmp/fastsync_test_output.txt && \
    grep -q "\[FULL\] file2.txt.*sending complete file" /tmp/fastsync_test_output.txt && \
    grep -q "\[SKIP\] file3.txt.*already up to date" /tmp/fastsync_test_output.txt && \
    grep -q "\[FULL\] file4.txt.*sending complete file" /tmp/fastsync_test_output.txt; then
-    echo "Incremental behavior test passed!"
+    echo "Continuous mode behavior test passed!"
 else
-    echo "Incremental behavior test failed!"
+    echo "Continuous mode behavior test failed!"
     cat /tmp/fastsync_test_output.txt
     exit 1
 fi

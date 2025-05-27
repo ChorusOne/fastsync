@@ -32,7 +32,7 @@ Usage:
   fastsync recv <server-addr> <num-streams> [options]
 
 Common options:
-  --incremental                  Transfer only changed parts of files (requires existing files at destination)
+  --continuous                   Keep syncing until no changes detected, skipping unchanged files
 
 Sender options:
   <listen-addr>                  Address (IP and port) for the sending side to bind to and
@@ -151,13 +151,13 @@ fn main() {
     match args.first().map(|s| &s[..]) {
         Some("send") if args.len() >= 3 => {
             let addr = &args[1];
-            let mut incremental = false;
+            let mut continuous = false;
             let mut max_bandwidth = None;
             let mut i = 2;
 
             while i < args.len() && args[i].starts_with('-') {
                 match args[i].as_str() {
-                    "--incremental" => incremental = true,
+                    "--continuous" => continuous = true,
                     "--max-bandwidth-mbps" => {
                         i += 1;
                         max_bandwidth = Some(
@@ -182,25 +182,36 @@ fn main() {
                 return;
             }
 
-            main_send(
-                SocketAddr::from_str(addr).expect("Invalid send address"),
-                fnames,
-                WIRE_PROTO_VERSION,
-                events_tx,
-                max_bandwidth,
-                incremental,
-            )
-            .expect("Failed to send.");
+            if continuous {
+                main_send_continuous(
+                    SocketAddr::from_str(addr).expect("Invalid send address"),
+                    fnames,
+                    WIRE_PROTO_VERSION,
+                    events_tx,
+                    max_bandwidth,
+                )
+                .expect("Failed to send in continuous mode.");
+            } else {
+                main_send(
+                    SocketAddr::from_str(addr).expect("Invalid send address"),
+                    fnames,
+                    WIRE_PROTO_VERSION,
+                    events_tx,
+                    max_bandwidth,
+                    continuous,
+                )
+                .expect("Failed to send.");
+            }
         }
         Some("recv") if args.len() >= 3 => {
             let addr = &args[1];
             let n_conn = &args[2];
-            let mut incremental = false;
+            let mut continuous = false;
             let mut i = 3;
 
             while i < args.len() && args[i].starts_with('-') {
                 match args[i].as_str() {
-                    "--incremental" => incremental = true,
+                    "--continuous" => continuous = true,
                     _ => {
                         eprintln!("Unknown option: {}", args[i]);
                         eprintln!("{}", USAGE);
@@ -210,14 +221,37 @@ fn main() {
                 i += 1;
             }
 
-            main_recv(
-                SocketAddr::from_str(addr).expect("Invalid recv address"),
-                n_conn,
-                WriteMode::AskConfirm,
-                WIRE_PROTO_VERSION,
-                incremental,
-            )
-            .expect("Failed to receive.");
+            if continuous {
+                // In continuous mode, keep retrying on errors
+                loop {
+                    match main_recv(
+                        SocketAddr::from_str(addr).expect("Invalid recv address"),
+                        n_conn,
+                        WriteMode::AskConfirm,
+                        WIRE_PROTO_VERSION,
+                        continuous,
+                    ) {
+                        Ok(()) => {
+                            // Should never reach here in continuous mode
+                            println!("Continuous mode unexpectedly exited");
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("Error in continuous mode: {}, retrying in 1 second...", e);
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                        }
+                    }
+                }
+            } else {
+                main_recv(
+                    SocketAddr::from_str(addr).expect("Invalid recv address"),
+                    n_conn,
+                    WriteMode::AskConfirm,
+                    WIRE_PROTO_VERSION,
+                    continuous,
+                )
+                .expect("Failed to receive.");
+            }
         }
         _ => eprintln!("{}", USAGE),
     }
@@ -382,13 +416,44 @@ fn all_filenames_from_path_names(fnames: &[String]) -> Result<Vec<String>> {
     Ok(all_files)
 }
 
+fn main_send_continuous(
+    addr: SocketAddr,
+    fnames: &[String],
+    protocol_version: u16,
+    sender_events: std::sync::mpsc::Sender<SenderEvent>,
+    max_bandwidth_mbps: Option<u64>,
+) -> Result<()> {
+    let mut round = 1;
+    
+    loop {
+        println!("\n=== Continuous sync round {} ===", round);
+        
+        // For continuous mode, always use the standard main_send which already handles
+        // the manifest-based sync properly
+        main_send(
+            addr,
+            fnames,
+            protocol_version,
+            sender_events.clone(),
+            max_bandwidth_mbps,
+            true, // continuous flag
+        )?;
+        
+        // Wait a bit before next round
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        round += 1;
+        
+        println!("\nWaiting for changes...");
+    }
+}
+
 fn main_send(
     addr: SocketAddr,
     fnames: &[String],
     protocol_version: u16,
     sender_events: std::sync::mpsc::Sender<SenderEvent>,
     max_bandwidth_mbps: Option<u64>,
-    incremental: bool,
+    continuous: bool,
 ) -> Result<()> {
     let mut plan = TransferPlan {
         proto_version: protocol_version,
@@ -453,8 +518,8 @@ fn main_send(
             stream.write_all(&buffer[..])?;
             println!("Waiting for the receiver to accept ...");
 
-            // In incremental mode, receive manifest reply and build actions
-            if incremental {
+            // In continuous mode, receive manifest reply and build actions
+            if continuous {
                 let manifest: ManifestReply = ManifestReply::deserialize_reader(&mut stream)?;
                 let mut actions = Vec::new();
 
@@ -479,7 +544,7 @@ fn main_send(
                 }
 
                 // Update send states based on actions
-                println!("\nIncremental sync actions:");
+                println!("\nContinuous mode sync actions:");
                 for (i, action) in actions.iter().enumerate() {
                     match action {
                         Action::Skip => {
@@ -682,30 +747,60 @@ fn main_recv(
     n_conn: &str,
     write_mode: WriteMode,
     protocol_version: u16,
-    incremental: bool,
+    continuous: bool,
 ) -> Result<()> {
     let n_connections: u32 = u32::from_str(n_conn).expect("Failed to parse number of connections.");
+    let mut round = 1;
+    let mut ask_confirm = write_mode;
 
-    // First we initiate one connection. The sender will send the plan over
-    // that. We read it. Unbuffered, because we want to skip the buffer for the
-    // remaining reads, but the header is tiny so it should be okay.
-    let mut stream = TcpStream::connect(addr)?;
-    let plan = TransferPlan::deserialize_reader(&mut stream)?;
-    if plan.proto_version != protocol_version {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!(
-                "Sender is version {} and we only support {WIRE_PROTO_VERSION}",
-                plan.proto_version
-            ),
-        ));
-    }
-    if write_mode == WriteMode::AskConfirm {
-        plan.ask_confirm_receive()?;
-    }
+    loop {
+        if continuous && round > 1 {
+            println!("\n=== Continuous sync round {} ===", round);
+        }
 
-    // Build manifest reply if incremental mode
-    let manifest_reply = if incremental {
+        // First we initiate one connection. The sender will send the plan over
+        // that. We read it. Unbuffered, because we want to skip the buffer for the
+        // remaining reads, but the header is tiny so it should be okay.
+        let mut stream = match TcpStream::connect(addr) {
+            Ok(s) => s,
+            Err(e) if e.kind() == ErrorKind::ConnectionRefused && continuous => {
+                // In continuous mode, sender might be restarting between rounds
+                println!("\nSender not available, retrying in 1 second...");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        
+        let plan = match TransferPlan::deserialize_reader(&mut stream) {
+            Ok(p) => p,
+            Err(e) if e.kind() == ErrorKind::ConnectionReset && continuous => {
+                // In continuous mode, connection reset means sender closed between rounds
+                println!("\nConnection reset by sender, retrying in 1 second...");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if plan.proto_version != protocol_version {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "Sender is version {} and we only support {WIRE_PROTO_VERSION}",
+                    plan.proto_version
+                ),
+            ));
+        }
+        if ask_confirm == WriteMode::AskConfirm {
+            plan.ask_confirm_receive()?;
+            // Only ask confirmation on first round in continuous mode
+            if continuous {
+                ask_confirm = WriteMode::Force;
+            }
+        }
+
+    // Build manifest reply if continuous mode
+    let manifest_reply = if continuous {
         let mut manifest = ManifestReply { files: Vec::new() };
 
         for file_plan in &plan.files {
@@ -735,8 +830,24 @@ fn main_recv(
 
         // Send manifest reply
         let manifest_data = borsh::to_vec(&manifest)?;
-        stream.write_all(&manifest_data)?;
-        stream.flush()?;
+        if let Err(e) = stream.write_all(&manifest_data) {
+            if e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::BrokenPipe {
+                // Connection closed by sender, retry
+                println!("\nConnection closed while sending manifest, retrying in 1 second...");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+            return Err(e);
+        }
+        if let Err(e) = stream.flush() {
+            if e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::BrokenPipe {
+                // Connection closed by sender, retry
+                println!("\nConnection closed while flushing, retrying in 1 second...");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+            return Err(e);
+        }
 
         Some(manifest)
     } else {
@@ -751,8 +862,8 @@ fn main_recv(
     let (sender, receiver) = mpsc::sync_channel::<Chunk>(16);
 
     let writer_thread = std::thread::spawn::<_, ()>(move || {
-        let (total_len, is_incremental) = if let Some(_manifest) = manifest_reply {
-            // For incremental mode, use original total as an estimate for progress
+        let (total_len, is_continuous) = if let Some(_manifest) = manifest_reply {
+            // For continuous mode, use original total as an estimate for progress
             // but don't enforce strict byte count at the end
             (plan.files.iter().map(|f| f.len).sum(), true)
         } else {
@@ -774,8 +885,8 @@ fn main_recv(
             print_progress(bytes_received, total_len, start_time);
         }
 
-        // Only check exact byte count in non-incremental mode
-        if !is_incremental && bytes_received < total_len {
+        // Only check exact byte count in non-continuous mode
+        if !is_continuous && bytes_received < total_len {
             panic!("Transmission ended, but not all data was received.");
         }
     });
@@ -855,13 +966,24 @@ fn main_recv(
     // crates, and create gigabytes of build artifacts, just to do a clean exit.
     // So as a hack, just connect one more time to wake up the sender's accept()
     // loop. It will conclude there is nothing to send and then exit.
-    match TcpStream::connect(addr) {
-        Ok(stream) => std::mem::drop(stream),
-        // Too bad if we can't wake up the sender, but it's not our problem.
-        Err(_) => {}
+    if let Ok(stream) = TcpStream::connect(addr) {
+        std::mem::drop(stream)
     }
+    // Too bad if we can't wake up the sender, but it's not our problem.
 
     writer_thread.join().expect("Failed to join writer thread.");
+
+        // In continuous mode, loop back for next round
+        if continuous {
+            round += 1;
+            // Add a small delay before next round
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        } else {
+            // In normal mode, we're done
+            break;
+        }
+    }
 
     Ok(())
 }
@@ -1038,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn test_incremental_sync() {
+    fn test_continuous_sync() {
         let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
         env::set_current_dir("/tmp/").unwrap();
         let cwd = env::current_dir().unwrap();

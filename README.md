@@ -48,21 +48,38 @@ On the receiving end, suppose we download with 32 TCP connections:
 
 File modification timestamps are preserved during all transfers.
 
-## Incremental transfers
+## Continuous mode
 
-Fastsync supports incremental transfers with the `--incremental` flag. When enabled, fastsync will:
+Fastsync supports continuous mode with the `--continuous` flag. When enabled, fastsync will:
 
 1. Compare files by name, size, and modification timestamp
 2. Skip files that already exist at the destination with matching size and timestamp
 3. Transfer only files that are missing or have different size/timestamp
+4. Keep syncing in rounds until no changes are detected
+5. After each transfer round, check if any files were modified during the transfer
+6. If changes are detected, start another sync round
+7. Stop when a complete round finishes with no changes detected
 
-Both sender and receiver must use the `--incremental` flag:
+Both sender and receiver must use the `--continuous` flag:
 
     # Sender
-    fastsync send 100.71.154.83:4440 --incremental file.tar.gz
+    fastsync send 100.71.154.83:4440 --continuous ./data
 
     # Receiver
-    fastsync recv 100.71.154.83:4440 32 --incremental
+    fastsync recv 100.71.154.83:4440 32 --continuous
+
+This mode is particularly useful for:
+- Syncing directories where files are still being written
+- Live database migrations where you sync while the database is running
+- Backup scenarios where files are being actively modified
+- Any situation where you need to minimize downtime during a transfer
+
+Typical workflow with `--continuous`:
+1. Start continuous mode while the source system is live
+2. Monitor the output - transfers will become smaller each round
+3. When transfers are minimal, stop the source application
+4. Let fastsync complete the final round
+5. You now have a complete, consistent copy
 
 ## Testing
 
