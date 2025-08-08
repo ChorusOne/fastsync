@@ -14,46 +14,38 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 use walkdir::WalkDir;
+
+use bpaf::{construct, long, positional, OptionParser, Parser};
 
 use crate::ratelimiter::RateLimiter;
 
 use borsh::BorshDeserialize;
 use borsh::BorshSerialize;
 
-const USAGE: &'static str = "Fastsync -- Transfer files over multiple TCP streams.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Verbosity {
+    Silent,
+    Verbose,
+}
 
-Usage:
-  fastsync send <listen-addr> <in-files...>
-  fastsync recv <server-addr> <num-streams>
-
-Sender options:
-  <listen-addr>                  Address (IP and port) for the sending side to bind to and
-                                 listen for receivers. This should be the address of a
-                                 Wireguard interface if you care about confidentiality.
-                                 E.g. '100.71.154.83:7999'.
-
-  [--max-bandwidth-mbps <MBps>]  Specify the maximum bandwidth to use over a 1 second sliding
-                                 window, in MB/s. If unspecified, there will be no limit.
-
-  <in-files...>                  Paths of files to send. Input file paths need to be relative.
-                                 This is a safety measure to make it harder to accidentally
-                                 overwrite files in /etc and the like on the receiving end.
-
-Receiver options:
-  <server-addr>                  The address (IP and port) that the sender is listening on.
-                                 E.g. '100.71.154.83:7999'.
-
-  <num-streams>                  The number of TCP streams to open. For a value of 1, Fastsync
-                                 behaves very similar to 'netcat'. With higher values,
-                                 Fastsync leverages the fact that file chunks don't need to
-                                 arrive in order to avoid the head-of-line blocking of a
-                                 single connection. You should experiment to find the best
-                                 value, going from 1 to 4 is usually helpful, going from 16
-                                 to 32 is probably overkill.
-";
+#[derive(Debug, Clone)]
+enum Command {
+    Send {
+        verbosity: Verbosity,
+        listen_addr: SocketAddr,
+        max_bandwidth: Option<u64>,
+        fnames: Vec<String>,
+    },
+    Recv {
+        verbosity: Verbosity,
+        server_addr: SocketAddr,
+        n_conn: u32,
+    },
+}
 
 const WIRE_PROTO_VERSION: u16 = 2;
 const MAX_CHUNK_LEN: u64 = 4096 * 64;
@@ -131,62 +123,128 @@ enum SenderEvent {
     Listening(u16),
 }
 
+fn parse_socket_addr(s: String) -> std::result::Result<SocketAddr, String> {
+    SocketAddr::from_str(&s).map_err(|e| format!("Invalid address '{}': {}", s, e))
+}
+
+fn cli() -> OptionParser<Command> {
+    #[inline]
+    fn verbosity() -> impl Parser<Verbosity> {
+        bpaf::short('v')
+            .long("verbose")
+            .help("Enable verbose debug output")
+            .flag(Verbosity::Verbose, Verbosity::Silent)
+    }
+    let send_parser = {
+        let max_bandwidth = long("max-bandwidth-mbps")
+            .help("Specify the maximum bandwidth to use over a 1 second sliding window, in MB/s. If unspecified, there will be no limit")
+            .argument::<u64>("MBPS")
+            .optional();
+
+        let listen_addr = positional::<String>("LISTEN_ADDR")
+            .help("Address (IP and port) for the sending side to bind to and listen for receivers. This should be the address of a Wireguard interface if you care about confidentiality. E.g. '100.71.154.83:7999'")
+            .parse(parse_socket_addr);
+
+        let fnames = positional::<String>("FILES")
+            .help("Paths of files to send. Input file paths need to be relative. This is a safety measure to make it harder to accidentally overwrite files in /etc and the like on the receiving end")
+            .some("At least one file must be specified");
+
+        construct!(Command::Send {
+            verbosity(),
+            max_bandwidth,
+            listen_addr,
+            fnames
+        })
+        .to_options()
+        .command("send")
+        .help("Send files to a receiver")
+    };
+
+    let recv_parser = {
+        let server_addr = positional::<String>("SERVER_ADDR")
+            .help("The address (IP and port) that the sender is listening on. E.g. '100.71.154.83:7999'")
+            .parse(parse_socket_addr);
+
+        let n_conn = positional::<u32>("NUM_STREAMS")
+            .help("The number of TCP streams to open. For a value of 1, Fastsync behaves very similar to 'netcat'. With higher values, Fastsync leverages the fact that file chunks don't need to arrive in order to avoid the head-of-line blocking of a single connection. You should experiment to find the best value, going from 1 to 4 is usually helpful, going from 16 to 32 is probably overkill");
+
+        construct!(Command::Recv {
+            verbosity(),
+            server_addr,
+            n_conn
+        })
+        .to_options()
+        .command("recv")
+        .help("Receive files from a receiver")
+    };
+
+    construct!([send_parser, recv_parser])
+        .to_options()
+        .descr("Fastsync -- Transfer files over multiple TCP streams")
+}
+
 fn main() {
-    // Skip the program name.
-    let args: Vec<_> = std::env::args().skip(1).collect();
     let (events_tx, events_rx) = std::sync::mpsc::channel::<SenderEvent>();
 
-    match args.first().map(|s| &s[..]) {
-        Some("send") if args.len() >= 3 => {
-            let addr = &args[1];
-            let max_bandwidth = match args[2].as_str() {
-                "--max-bandwidth-mbps" => Some(
-                    args[3]
-                        .parse::<u64>()
-                        .expect("Invalid number for --max-bandwidth-mbps"),
-                ),
-                _ => None,
-            };
-            let fnames = if max_bandwidth.is_some() {
-                &args[4..]
-            } else {
-                &args[2..]
-            };
+    match cli().run() {
+        Command::Send {
+            verbosity,
+            listen_addr,
+            max_bandwidth,
+            fnames,
+        } => {
             main_send(
-                SocketAddr::from_str(addr).expect("Invalid send address"),
-                fnames,
+                listen_addr,
+                &fnames,
                 WIRE_PROTO_VERSION,
                 events_tx,
                 max_bandwidth,
+                verbosity,
             )
             .expect("Failed to send.");
         }
-        Some("recv") if args.len() == 3 => {
-            let addr = &args[1];
-            let n_conn = &args[2];
+        Command::Recv {
+            verbosity,
+            server_addr,
+            n_conn,
+        } => {
             main_recv(
-                SocketAddr::from_str(addr).expect("Invalid recv address"),
+                server_addr,
                 n_conn,
                 WriteMode::AskConfirm,
                 WIRE_PROTO_VERSION,
+                verbosity,
             )
             .expect("Failed to receive.");
         }
-        _ => eprintln!("{}", USAGE),
     }
     drop(events_rx);
 }
 
-fn print_progress(offset: u64, len: u64, start_time: Instant) {
+fn print_progress(offset: u64, len: u64, start_time: Instant) -> std::io::Result<()> {
     let secs_elapsed = start_time.elapsed().as_secs_f32();
     let percentage = (offset as f32) * 100.0 / (len as f32);
     let bytes_per_sec = (offset as f32) / secs_elapsed;
     let mb_per_sec = bytes_per_sec * 1e-6;
     let secs_left = (len - offset) as f32 / bytes_per_sec;
-    let mins_left = secs_left / 60.0;
-    println!(
-        "[{offset} / {len}] {percentage:5.1}% {mb_per_sec:.2} MB/s, {mins_left:.1} minutes left",
-    );
+    let hours = (secs_left / 3600.0) as u32;
+    let mins = ((secs_left % 3600.0) / 60.0) as u32;
+
+    let offset_gb = offset as f64 / 1_000_000_000.0;
+    let len_gb = len as f64 / 1_000_000_000.0;
+
+    let mut stdout = std::io::stdout().lock();
+
+    // Clear rest of line, add a newline and move back to progress line
+    // In normal mode, this shows as one constantly changing line,
+    // while not interfering with verbose mode logs.
+    let escape_seq = "\x1b[K\n\x1b[A";
+    write!(
+        stdout,
+        "\r[{:.2} GB / {:.2} GB] {percentage:2.1}% {mb_per_sec:.2} MB/s, {hours}h {mins}m left{escape_seq}",
+        offset_gb, len_gb
+    )?;
+    stdout.flush()
 }
 
 enum SendStateInner {
@@ -233,7 +291,7 @@ impl ChunkHeader {
 }
 
 impl SendState {
-    pub fn send_one(&self, start_time: Instant, out: &mut TcpStream) -> Result<SendResult> {
+    pub fn send_one(&self, out: &mut TcpStream, verbosity: Verbosity) -> Result<SendResult> {
         // By deferring the opening of the file descriptor to this point,
         // we effectively limit the amount of open files to the amount of send threads.
         // However, this now introduces the possibility of files getting deleted between
@@ -278,19 +336,19 @@ impl SendState {
         // send data from the same file at once
         std::mem::drop(state);
 
-        print_progress(offset, self.len, start_time);
-
         let header = ChunkHeader {
             file_id: self.id,
             offset,
             len: u32::try_from(end - offset).expect("Chunks are smaller than 4 GiB."),
         };
         out.write_all(&header.to_bytes()[..])?;
-        println!(
-            "SEND-CHUNK {:?} header_len={}",
-            header,
-            borsh::to_vec(&header)?.len()
-        );
+        if Verbosity::Verbose == verbosity {
+            println!(
+                "SEND-CHUNK {:?} header_len={}",
+                header,
+                borsh::to_vec(&header)?.len()
+            );
+        }
 
         let end = end as i64;
         let mut off = offset as i64;
@@ -341,22 +399,26 @@ fn main_send(
     protocol_version: u16,
     sender_events: std::sync::mpsc::Sender<SenderEvent>,
     max_bandwidth_mbps: Option<u64>,
+    verbosity: Verbosity,
 ) -> Result<()> {
     let mut plan = TransferPlan {
         proto_version: protocol_version,
         files: Vec::new(),
     };
     let mut send_states = Vec::new();
+    let mut total_size = 0;
 
     for (i, fname) in all_filenames_from_path_names(fnames)?.iter().enumerate() {
         let metadata = std::fs::metadata(fname)?;
+        let file_len = metadata.len();
+        total_size += file_len;
         let file_plan = FilePlan {
             name: fname.clone(),
-            len: metadata.len(),
+            len: file_len,
         };
         let state = SendState {
             id: FileId::from_usize(i),
-            len: metadata.len(),
+            len: file_len,
             state: parking_lot::Mutex::new(SendStateInner::Pending {
                 fname: fname.into(),
             }),
@@ -373,6 +435,8 @@ fn main_send(
     let mut push_threads = Vec::new();
     let listener = std::net::TcpListener::bind(addr)?;
 
+    let total_bytes_sent = Arc::new(AtomicU64::new(0));
+
     println!("Waiting for the receiver ...");
     sender_events
         .send(SenderEvent::Listening(
@@ -387,9 +451,13 @@ fn main_send(
         _ = limiter_mutex.lock().unwrap().insert(ratelimiter);
     }
 
+    let mut start_time_opt: Option<Instant> = None;
     loop {
         let (mut stream, addr) = listener.accept()?;
-        println!("Accepted connection from {addr}.");
+        let start_time = *start_time_opt.get_or_insert_with(Instant::now);
+        if Verbosity::Verbose == verbosity {
+            println!("Accepted connection from {addr}.");
+        }
 
         // If we are the first connection, then we need to send the plan first.
         if let Some(plan) = plan.take() {
@@ -410,10 +478,9 @@ fn main_send(
         }
 
         let state_clone = state_arc.clone();
-
         let limiter_mutex_2 = limiter_mutex.clone();
+        let total_bytes_sent_clone = total_bytes_sent.clone();
         let push_thread = std::thread::spawn(move || {
-            let start_time = Instant::now();
             // All the threads iterate through all the files one by one, so all
             // the threads collaborate on sending the first one, then the second
             // one, etc.
@@ -429,13 +496,23 @@ fn main_send(
                         // capacity, which is a programming error. Crash the program.
                         std::thread::sleep(to_wait.unwrap());
                     }
-                    match file.send_one(start_time, &mut stream) {
+                    match file.send_one(&mut stream, verbosity) {
                         Ok(SendResult::FileVanished) => {
-                            println!("File {:?} vanished", file.id);
+                            if Verbosity::Verbose == verbosity {
+                                println!("File {:?} vanished", file.id);
+                            }
                         }
                         Ok(SendResult::Progress {
                             bytes_sent: bytes_written,
                         }) => {
+                            let prev_total_bytes_sent =
+                                total_bytes_sent_clone.fetch_add(bytes_written, Ordering::Relaxed);
+                            print_progress(
+                                prev_total_bytes_sent + bytes_written,
+                                total_size,
+                                start_time,
+                            )
+                            .ok();
                             if let Some(ref mut ratelimiter) = opt_ratelimiter {
                                 ratelimiter.consume_bytes(Instant::now(), bytes_written);
                             }
@@ -541,12 +618,11 @@ impl FileReceiver {
 
 fn main_recv(
     addr: SocketAddr,
-    n_conn: &str,
+    n_connections: u32,
     write_mode: WriteMode,
     protocol_version: u16,
+    verbosity: Verbosity,
 ) -> Result<()> {
-    let n_connections: u32 = u32::from_str(n_conn).expect("Failed to parse number of connections.");
-
     // First we initiate one connection. The sender will send the plan over
     // that. We read it. Unbuffered, because we want to skip the buffer for the
     // remaining reads, but the header is tiny so it should be okay.
@@ -586,7 +662,7 @@ fn main_recv(
             // end of the channel, just crash the entire program so that the
             // error message is clearer.
             file.handle_chunk(chunk).expect("Failed to write chunk.");
-            print_progress(bytes_received, total_len, start_time);
+            let _ = print_progress(bytes_received, total_len, start_time);
         }
 
         if bytes_received < total_len {
@@ -626,7 +702,9 @@ fn main_recv(
                 };
 
                 let header = ChunkHeader::try_from_slice(&buf[..])?;
-                println!("RECV-CHUNK {:?}", header);
+                if Verbosity::Verbose == verbosity {
+                    println!("RECV-CHUNK {:?}", header);
+                }
                 assert!(
                     (header.len as u64) <= MAX_CHUNK_LEN,
                     "{} <= {}",
@@ -701,6 +779,7 @@ mod tests {
                 1,
                 events_tx,
                 None,
+                Verbosity::Silent,
             )
             .unwrap();
         });
@@ -708,9 +787,10 @@ mod tests {
             SenderEvent::Listening(port) => {
                 main_recv(
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
-                    "1",
+                    1,
                     WriteMode::Force,
                     1,
+                    Verbosity::Silent,
                 )
                 .unwrap();
             }
@@ -728,6 +808,7 @@ mod tests {
                 2,
                 events_tx,
                 None,
+                Verbosity::Silent,
             )
             .unwrap();
         });
@@ -735,12 +816,13 @@ mod tests {
             SenderEvent::Listening(port) => {
                 let res = main_recv(
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
-                    "1",
+                    1,
                     WriteMode::Force,
                     1,
+                    Verbosity::Silent,
                 );
                 assert_eq!(
-                    res.err().expect("Expected failure").kind(),
+                    res.expect_err("Expected failure").kind(),
                     ErrorKind::InvalidData
                 );
             }
@@ -789,6 +871,7 @@ mod tests {
                 1,
                 events_tx,
                 None,
+                Verbosity::Silent,
             )
             .unwrap();
         });
@@ -796,9 +879,10 @@ mod tests {
             SenderEvent::Listening(port) => {
                 main_recv(
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
-                    "1",
+                    1,
                     WriteMode::Force,
                     1,
+                    Verbosity::Silent,
                 )
                 .unwrap();
             }
@@ -825,6 +909,7 @@ mod tests {
                 1,
                 events_tx,
                 None,
+                Verbosity::Silent,
             )
             .unwrap();
         });
@@ -832,9 +917,10 @@ mod tests {
             SenderEvent::Listening(port) => {
                 main_recv(
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
-                    "1",
+                    1,
                     WriteMode::Force,
                     1,
+                    Verbosity::Silent,
                 )
                 .unwrap();
             }
