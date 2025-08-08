@@ -49,11 +49,6 @@ On the receiving end, suppose we download with 32 TCP connections:
     cd /some/path
     fastsync recv 100.71.154.83:4440 32
 
-## Known issues
-
- * It's too spammy.
- * Transfer time estimation can be improved.
-
 ## License
 
 Fastsync is licensed under the [Apache 2.0 License][apache2]. A copy of the
