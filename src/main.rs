@@ -181,6 +181,7 @@ fn cli() -> OptionParser<Command> {
     construct!([send_parser, recv_parser])
         .to_options()
         .descr("Fastsync -- Transfer files over multiple TCP streams")
+        .version(env!("CARGO_PKG_VERSION"))
 }
 
 fn main() {
